@@ -1,21 +1,16 @@
 # Examples
 
-ThunderAgent includes end-to-end examples for both inference/rollout and RL training pipelines.
+ThunderAgent examples are split into agent scaffolds and benchmark modules.
 
-## Serving
+## Scaffold
 
-Complete inference examples demonstrating ThunderAgent with various agentic frameworks:
+Agent frameworks that can be routed through ThunderAgent:
 
 | Agent | Directory | Description |
 |-------|-----------|-------------|
-| **SWE-Agent** | [`mini-swe-agent`](../examples/inference/mini-swe-agent) | Software engineering agent using [mini-swe-agent](https://github.com/SWE-agent/mini-swe-agent) with Docker-based code sandboxes |
-| **OpenHands** | [`OpenHands`](../examples/inference/OpenHands) | General software development and science discovery agent using [OpenHands](https://github.com/All-Hands-AI/OpenHands) |
-| **ToolOrchestra** | [`ToolOrchestra`](../examples/inference/ToolOrchestra) | Routing agent that orchestrates other sub-agents using [ToolOrchestra](https://github.com/NVlabs/ToolOrchestra) |
-
-Each example includes:
-- Setup scripts and configuration
-- Instructions for single-node and multi-node deployments
-- Integration with ThunderAgent's program-aware scheduling
+| **OpenHands** | [`scaffold/openhands`](../examples/scaffold/openhands) | General software development and science discovery agent |
+| **mini-swe-agent** | [`scaffold/mini-swe-agent`](../examples/scaffold/mini-swe-agent) | Lightweight SWE-agent framework with Docker-based code sandboxes |
+| **ToolOrchestra** | [`scaffold/toolorchestra`](../examples/scaffold/toolorchestra) | Multi-tool orchestration workflow |
 
 ### Quick Example: mini-swe-agent
 
@@ -27,20 +22,15 @@ vllm serve Qwen/Qwen3-32B --port 8000
 thunderagent --backend-type vllm --backends http://localhost:8000 --port 9000 --router tr --metrics --profile
 
 # 3. Run mini-swe-agent pointing to ThunderAgent
-cd examples/inference/mini-swe-agent
+cd examples/scaffold/mini-swe-agent
 # Follow README.md for setup and execution
 ```
 
-## RL Training
+## Benchmark
 
-RL training pipelines that integrate ThunderAgent into the rollout phase for program-aware scheduling:
+Benchmark modules contain launch scripts, adapters, and analysis code for studying tool-call behavior:
 
-| Agent | Directory | Description |
-|-------|-----------|-------------|
-| **Search Agent** | [`slime`](../examples/rl_training/slime) | RL training for search-augmented reasoning using [slime](https://github.com/THUDM/slime) |
-| **SWE Agent** | [`SkyRL`](../examples/rl_training/SkyRL) | RL training for software engineering agent using [SkyRL](https://github.com/NovaSky-AI/SkyRL) |
-
-The RL training examples demonstrate:
-- Integrating ThunderAgent's router into the rollout phase of [SkyRL](https://github.com/NovaSky-AI/SkyRL) (which uses vLLM's async LLM engine internally) and [slime](https://github.com/THUDM/slime) (which uses sglang inference engine) training frameworks
-- Using the `--backend-type skyrl` option to adapt to SkyRL's aggregated JSON metrics format
-- Docker-based training environments
+| Benchmark | Directory | Description |
+|-----------|-----------|-------------|
+| **SWE-bench** | [`benchmark/swebench`](../examples/benchmark/swebench) | OpenHands + ThunderAgent runner and tool-call/profile analysis utilities |
+| **tau-bench** | [`benchmark/tau-bench`](../examples/benchmark/tau-bench) | tau-bench tool-call adapters without slime training code |

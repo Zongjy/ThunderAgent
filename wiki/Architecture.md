@@ -32,8 +32,8 @@ ThunderAgent acts as a proxy layer between agentic clients and inference backend
          │
          ▼
 ┌─────────────────────┐
-│ Inference Engines   │  vLLM / SGLang (serving)
-│ (one or more GPUs)  │  SkyRL (RL rollout via vLLM async engine)
+│ Inference Engines   │  vLLM / SGLang
+│ (one or more GPUs)  │
 └─────────────────────┘
 ```
 
@@ -50,7 +50,6 @@ ThunderAgent/
 │   ├── metrics_base.py      # Abstract MetricsClient interface
 │   ├── vllm_metrics.py      # vLLM Prometheus metrics parser & client
 │   ├── sglang_metrics.py    # SGLang metrics parser & client
-│   ├── skyrl_metrics.py     # SkyRL JSON metrics parser & client
 │   └── state.py             # BackendState: capacity tracking, program registry
 ├── program/
 │   ├── __init__.py

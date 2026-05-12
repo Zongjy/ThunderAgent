@@ -1,30 +1,22 @@
 # Examples
 
-## Inference / Rollout
+This branch organizes examples around tool-call analysis rather than training pipelines.
 
-End-to-end inference and rollout examples with ThunderAgent on both single-node and multi-node setups:
+## Scaffold
 
-| Agent | Directory | Description |
-|-------|-----------|-------------|
-| SWE-Agent | [`inference/mini-swe-agent`](inference/mini-swe-agent) | Software engineering agent with Docker-based code sandbox |
-| OpenHands | [`inference/OpenHands`](inference/OpenHands) | Agent for general software development tasks and science discovery |
-| ToolOrchestra | [`inference/ToolOrchestra`](inference/ToolOrchestra) | Multi-tool orchestration agent for complex workflows |
-
-
-## Data Generation
-
-Large-scale rollout generation with ThunderAgent:
+Agent frameworks that can be pointed at ThunderAgent:
 
 | Agent | Directory | Description |
 |-------|-----------|-------------|
-| OpenHands | [`datagen/harbor`](datagen/harbor/) | SWE-bench trajectory generation at scale with Harbor + SGLang |
+| OpenHands | [`scaffold/openhands`](scaffold/openhands) | Software development agent scaffold used by SWE-bench runs |
+| mini-swe-agent | [`scaffold/mini-swe-agent`](scaffold/mini-swe-agent) | Lightweight SWE-agent scaffold with Docker-based code sandboxes |
+| ToolOrchestra | [`scaffold/toolorchestra`](scaffold/toolorchestra) | Multi-tool orchestration scaffold for HLE-style runs |
 
+## Benchmark
 
-## RL Training
+Benchmark-specific runners and analysis code:
 
-Complete RL training pipelines with ThunderAgent:
-
-| Agent | Directory | Description |
-|-------|-----------|-------------|
-| Search-R1 Agent | [`rl_training/slime`](rl_training/slime/) | RL training for search-augmented reasoning agent |
-| SWE Agent | [`rl_training/SkyRL`](rl_training/SkyRL/) | RL training for software engineering agent |
+| Benchmark | Directory | Description |
+|-----------|-----------|-------------|
+| SWE-bench | [`benchmark/swebench`](benchmark/swebench) | OpenHands + ThunderAgent runner and tool-call/profile analysis utilities |
+| tau-bench | [`benchmark/tau-bench`](benchmark/tau-bench) | tau-bench tool-call adapters kept without slime training code |

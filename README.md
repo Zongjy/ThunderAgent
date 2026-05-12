@@ -1,52 +1,34 @@
 <!-- markdownlint-disable MD001 MD041 -->
-<p align="center">
-  <img alt="ThunderAgent" src="assets/logos/thunderagent.png" width=55%>
-</p>
-
-<h3 align="center">
-Fast, simple and program-aware agentic inference system.
-</h3>
+# ThunderAgent
 
 <p align="center">
 | <a href="https://deepwiki.com/HaoKang-Timmy/ThunderAgent"><b>Wiki</b></a> | <a href="https://thunderagent.ai"><b>Blog</b></a> | <a href="https://arxiv.org/pdf/2602.13692"><b>Paper</b></a> |
 </p>
 
-
-
 ---
 
 ## About
-ThunderAgent is a fast and easy-to-use library for agentic inference and rollout.
-
-
+ThunderAgent is a fast and easy-to-use library for program-aware agentic inference. This branch is trimmed for analyzing tool-call behavior across different agent benchmarks.
 
 ThunderAgent is fast with:
 
 - Agentic program-aware scheduler that increases KV-cache hit rate and reduces memory imbalance across nodes, increasing agentic inference **throughputs 1.5-3.6x** across multiple agentic workflows.
-- Tool-call lifecycle management with automatic resource reclaim for more stable and reliable long-running rollouts
+- Tool-call lifecycle tracking for per-program profiling and benchmark analysis.
 
 ThunderAgent is flexible and easy to use with:
 - OpenAI-compatible API passthrough with only one changing, adding `Program_id` to the sending API.
 - Multiple inference support for [vLLM](https://github.com/vllm-project/vllm) and [SGLang](https://github.com/sgl-project/sglang)
-
-- Multiple agentic RL training example like [Search-R1](https://github.com/PeterGriffinJin/Search-R1) agent with [slime](https://github.com/THUDM/slime) and [mini-swe-agent](https://github.com/SWE-agent/mini-swe-agent) with [SkyRL](https://github.com/NovaSky-AI/SkyRL).
-- Real-time visualization of agentic trajectory metrics including total tokens, tool-use time, and per-program profiling.
+- Scaffold examples for OpenHands, mini-swe-agent, and ToolOrchestra under [`examples/scaffold`](examples/scaffold).
+- Benchmark analysis entry points for SWE-bench and tau-bench style workloads under [`examples/benchmark`](examples/benchmark).
+- Per-program profiling for total tokens, tool-use time, pause time, and request timing.
 
 ### Overview
 
-ThunderAgent sits between agent clients and the infrastructure layer as an agentic workflow scheduler. On one hand, it improves inference throughput of vLLM/SGLang across multiple GPU nodes through program-aware scheduling. On the other hand, it provides a unified tool management interface for resources like Docker containers and remote APIs.
-
-<p align="center">
-  <img alt="ThunderAgent Architecture" src="assets/logos/arch.png" width=55%>
-</p>
+ThunderAgent sits between agent clients and vLLM/SGLang as an OpenAI-compatible proxy. It tracks each agent program by `program_id`, schedules requests across one or more backends, and exposes profiling data that is useful for studying tool-call-heavy benchmarks.
 
 ### Inference & Evaluation Results
 
 ThunderAgent improves vLLM throughput by **1.5–3.6×** across diverse agentic workloads including SWE-Agent, OpenHands, and ToolOrchestra.
-
-<p align="center">
-  <img alt="Inference Pipeline Results" src="assets/logos/infer_pipeline.png" width=90%>
-</p>
 
 ## Demo
 

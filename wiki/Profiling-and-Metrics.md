@@ -94,12 +94,6 @@ ThunderAgent polls each backend's metrics endpoint and tracks:
 - Used token count
 - Cumulative prompt and generation tokens
 
-**SkyRL Metrics:**
-- Requests running and waiting (aggregated across engines)
-- Average KV cache usage percentage
-- Preemption count
-- Engine count
-
 ### Metrics History
 
 Each backend maintains a ring buffer of the last 12 metrics samples. This is used internally for trend analysis and exposed via the `/metrics` API.

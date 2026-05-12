@@ -1,5 +1,10 @@
-LangGraph_jiayi/.venv
-openhands_swebench/OpenHands/outputs/
-openhands_swebench/system_monitor.csv
 *.pyc
 .venv
+*.egg-info
+.egg-info/
+.codex
+/uv.lock
+.eval_sessions/
+outputs/
+**/runs/
+.codex_tmp*/

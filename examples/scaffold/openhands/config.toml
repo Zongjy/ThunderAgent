@@ -1,0 +1,7 @@
+[llm.vllm_local]
+model = "Qwen/Qwen3-8B"
+custom_llm_provider = "openai"
+base_url = "http://127.0.0.1:9000/v1"
+api_key = "EMPTY"
+temperature = 0.0
+native_tool_calling = true

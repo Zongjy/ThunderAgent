@@ -12,7 +12,7 @@ class Config:
     # Router mode: "default" (pure proxy) or "tr" (capacity scheduling)
     router_mode: str = "tr"
 
-    # Backend type: "vllm", "sglang", or "skyrl"
+    # Backend type: "vllm" or "sglang"
     backend_type: str = "vllm"
     
     # Profile configuration

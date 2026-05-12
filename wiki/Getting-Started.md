@@ -4,7 +4,6 @@
 
 - Python >= 3.10
 - An inference serving engine: [vLLM](https://github.com/vllm-project/vllm) or [SGLang](https://github.com/sgl-project/sglang) 
-- Optional for agentic RL training: [slime](https://github.com/THUDM/slime) or [SkyRL](https://github.com/NovaSky-AI/SkyRL)
 
 ## Installation
 
