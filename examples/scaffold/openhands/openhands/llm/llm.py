@@ -47,6 +47,23 @@ from openhands.llm.fn_call_converter import (
 )
 from openhands.llm.retry_mixin import RetryMixin
 
+try:
+    from ThunderAgent.adapters import current_program_id, patch_litellm_kwargs
+except ImportError:
+    if not (
+        os.environ.get('OPENHANDS_SESSION_ID')
+        and os.path.abspath(__file__).startswith('/openhands/code/')
+    ):
+        raise
+
+    def current_program_id(default: str | None = None) -> str | None:
+        return default
+
+    def patch_litellm_kwargs(
+        kwargs: dict[str, Any], program_id: str | None = None
+    ) -> dict[str, Any]:
+        return kwargs
+
 __all__ = ['LLM']
 
 # tuple of exceptions to retry on
@@ -327,15 +344,15 @@ class LLM(RetryMixin, DebugMixin):
             # NOTE: this setting is global; unlike drop_params, it cannot be overridden in the litellm completion partial
             litellm.modify_params = self.config.modify_params
 
-            thunderagent_program_id = os.environ.get('OPENHANDS_PROGRAM_ID')
+            extra_body = kwargs.get('extra_body')
+            config_program_id = (
+                extra_body.get('program_id')
+                if isinstance(extra_body, dict)
+                else None
+            )
+            thunderagent_program_id = current_program_id(config_program_id)
             if thunderagent_program_id:
-                extra_body = kwargs.get('extra_body')
-                if isinstance(extra_body, dict):
-                    extra_body = extra_body.copy()
-                else:
-                    extra_body = {}
-                extra_body['program_id'] = thunderagent_program_id
-                kwargs['extra_body'] = extra_body
+                patch_litellm_kwargs(kwargs, thunderagent_program_id)
 
             # If we're not using litellm proxy, remove extra_body by default.
             # Exception: keep it when we explicitly inject ThunderAgent program_id.

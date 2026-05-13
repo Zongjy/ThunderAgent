@@ -160,6 +160,7 @@ start_thunderagent() {
 
 run_swebench() {
   log_info "Running OpenHands SWE-bench evaluation"
+  export PYTHONPATH="$(pwd):${PYTHONPATH:-}"
   cd "./examples/scaffold/openhands"
   python -m evaluation.benchmarks.swe_bench.run_infer \
     --config-file config.toml \

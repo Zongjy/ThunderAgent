@@ -23,8 +23,6 @@ source examples/scaffold/openhands/scripts/setup/setup.sh
 
 如果路径不同，改下面参数表里的 `VLLM_*` 或 `PYTHON_BIN`。
 
-注意：如果切回 `SWE-Lego/SWE-Lego-Qwen3-8B`，它的 HF 缓存 `config.json` 需要保证 `max_position_embeddings` 是整数 `163840`，不是 `163840.0`。
-
 ## 快速运行
 
 ```bash

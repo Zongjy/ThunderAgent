@@ -393,6 +393,13 @@ if __name__ == '__main__':
         )
         from swebench.harness.utils import load_swebench_dataset
 
+        # Patch swebench to avoid fetching requirements/environment from GitHub
+        # (network to raw.githubusercontent.com is unavailable; Docker images
+        # already have all dependencies pre-installed).
+        import swebench.harness.test_spec.python as swebench_py
+        swebench_py.get_requirements = lambda instance: ""
+        swebench_py.get_environment_yml = lambda instance, env_name: f"name: {env_name}"
+
     # Load SWE-Bench dataset
     full_dataset: list[SWEbenchInstance] = load_swebench_dataset(
         args.dataset, args.split

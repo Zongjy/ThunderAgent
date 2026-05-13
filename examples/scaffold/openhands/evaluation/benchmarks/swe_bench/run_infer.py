@@ -1,11 +1,8 @@
 import asyncio
 import copy
-import hashlib
 import json
 import os
 import tempfile
-import urllib.error
-import urllib.request
 from typing import Any, Literal
 
 import pandas as pd
@@ -13,6 +10,7 @@ import toml
 from datasets import load_dataset
 from jinja2 import Environment, FileSystemLoader
 
+from ThunderAgent.adapters import ThunderAgentProgram, use_program
 import openhands.agenthub
 from evaluation.benchmarks.swe_bench.binary_patch_utils import (
     remove_binary_diffs,
@@ -642,37 +640,16 @@ def process_instance(
     reset_logger: bool = True,
     runtime_failure_count: int = 0,
 ) -> EvalOutput:
-    def _make_thunderagent_program_id(instance_id: str) -> str:
-        digest = hashlib.sha1(f'{instance_id}:{os.getpid()}'.encode('utf-8')).hexdigest()
-        return f'swe-{digest[:16]}'
+    program = ThunderAgentProgram.create(
+        str(instance.instance_id),
+        scaffold='openhands-swe',
+        base_url=metadata.llm_config.base_url,
+    )
+    program_id = program.program_id
 
-    def _release_thunderagent_program(base_url: str | None, program_id: str) -> None:
-        if not base_url:
-            return
-        url = base_url.rstrip('/')
-        if url.endswith('/v1'):
-            url = url[:-3]
-        release_url = f'{url}/programs/release'
-        try:
-            req = urllib.request.Request(
-                release_url,
-                data=json.dumps({'program_id': program_id}).encode('utf-8'),
-                headers={'Content-Type': 'application/json'},
-                method='POST',
-            )
-            with urllib.request.urlopen(req, timeout=5):
-                pass
-        except Exception as exc:
-            logger.warning(
-                f'ThunderAgent program release failed for {program_id}: {exc}'
-            )
-
-    program_id = _make_thunderagent_program_id(str(instance.instance_id))
-    prev_program_id = os.environ.get('OPENHANDS_PROGRAM_ID')
-    os.environ['OPENHANDS_PROGRAM_ID'] = program_id
-
-    try:
+    with use_program(program):
         config = get_config(instance, metadata)
+        config.set_llm_config(program.llm_config(config.get_llm_config()))
 
         # Setup the logger properly, so you can run multi-processing to parallelize the evaluation
         if reset_logger:
@@ -777,12 +754,6 @@ def process_instance(
             error=state.last_error if state and state.last_error else None,
         )
         return output
-    finally:
-        _release_thunderagent_program(metadata.llm_config.base_url, program_id)
-        if prev_program_id is None:
-            os.environ.pop('OPENHANDS_PROGRAM_ID', None)
-        else:
-            os.environ['OPENHANDS_PROGRAM_ID'] = prev_program_id
 
 
 def filter_dataset(dataset: pd.DataFrame, filter_column: str) -> pd.DataFrame:

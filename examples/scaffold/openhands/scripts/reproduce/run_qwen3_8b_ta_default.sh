@@ -175,6 +175,7 @@ run_swebench() {
   log "Running SWE-bench Lite: limit=${SWEBENCH_LIMIT}, workers=${SWEBENCH_WORKERS}, max_iter=${SWEBENCH_MAX_ITERATIONS}"
   log "OpenHands output dir: ${OUTPUT_DIR}"
   cd "${SCAFFOLD_DIR}/openhands"
+  export PYTHONPATH="${THUNDERAGENT_ENV_DIR}:${PYTHONPATH:-}"
   export EVAL_DOCKER_IMAGE_SOURCE=epoch 
   "${PYTHON_BIN}" -m evaluation.benchmarks.swe_bench.run_infer \
     --config-file "${RUN_CONFIG}" \
