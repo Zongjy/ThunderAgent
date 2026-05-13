@@ -1,0 +1,8 @@
+browsergym-core==0.14.3
+browsergym-webarena==0.14.3
+browsergym-webarena-verified==0.14.3
+git+https://github.com/ServiceNow/webarena-verified.git
+gymnasium>=1.2,<2
+nltk>=3.9,<4
+openai==2.8.0
+playwright==1.44

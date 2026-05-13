@@ -11,6 +11,7 @@ Agent frameworks that can be routed through ThunderAgent:
 | **OpenHands** | [`scaffold/openhands`](../examples/scaffold/openhands) | General software development and science discovery agent |
 | **mini-swe-agent** | [`scaffold/mini-swe-agent`](../examples/scaffold/mini-swe-agent) | Lightweight SWE-agent framework with Docker-based code sandboxes |
 | **ToolOrchestra** | [`scaffold/toolorchestra`](../examples/scaffold/toolorchestra) | Multi-tool orchestration workflow |
+| **BrowserGym + WebArena-Verified** | [`scaffold/browsergym_webarena`](../examples/scaffold/browsergym_webarena) | BrowserGym web-agent scaffold with ThunderAgent-backed OpenAI calls |
 
 ### Quick Example: mini-swe-agent
 
@@ -34,3 +35,4 @@ Benchmark modules contain launch scripts, adapters, and analysis code for studyi
 |-----------|-----------|-------------|
 | **SWE-bench** | [`benchmark/swebench`](../examples/benchmark/swebench) | OpenHands + ThunderAgent runner and tool-call/profile analysis utilities |
 | **tau-bench** | [`benchmark/tau-bench`](../examples/benchmark/tau-bench) | tau-bench tool-call adapters without slime training code |
+| **WebArena-Verified** | [`benchmark/webarena`](../examples/benchmark/webarena) | BrowserGym + WebArena-Verified runner and browser action/observation analysis |
