@@ -10,7 +10,7 @@ official package. This scaffold only registers a ThunderAgent-backed
 The official τ³ package currently requires Python `>=3.12`.
 
 ```bash
-pip install -r requirements.txt
+bash examples/scripts/setup_benchmark_env.sh tau3
 ```
 
 When running from this ThunderAgent checkout, `examples/benchmark/tau3/run_tau3_ta_default.sh`

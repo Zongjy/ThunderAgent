@@ -8,7 +8,8 @@ set -euo pipefail
 # ---- Configurable parameters -------------------------------------------------
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 TAU3_DIR="${REPO_ROOT}/examples/scaffold/tau3"
-THUNDERAGENT_ENV_DIR="${THUNDERAGENT_ENV_DIR:-${REPO_ROOT}/.venv}"
+TAU3_ENV_DIR="${TAU3_ENV_DIR:-${REPO_ROOT}/.venv-tau3}"
+THUNDERAGENT_ENV_DIR="${THUNDERAGENT_ENV_DIR:-${TAU3_ENV_DIR}}"
 VLLM_ROOT="${VLLM_ROOT:-${HOME}/vllm}"
 VLLM_ENV_DIR="${VLLM_ENV_DIR:-${VLLM_ROOT}/.venv}"
 VLLM_WORKDIR="${VLLM_WORKDIR:-${VLLM_ROOT}}"
@@ -40,8 +41,10 @@ TAU3_NUM_TASKS="${TAU3_NUM_TASKS:-${TAU3_LIMIT:-0}}" # 0 means all tasks in the 
 TAU3_NUM_TRIALS="${TAU3_NUM_TRIALS:-1}"
 TAU3_MAX_STEPS="${TAU3_MAX_STEPS:-100}"
 TAU3_MAX_ERRORS="${TAU3_MAX_ERRORS:-10}"
-TAU3_MAX_CONCURRENCY="${TAU3_MAX_CONCURRENCY:-1}"
+TAU3_MAX_CONCURRENCY="${TAU3_MAX_CONCURRENCY:-4}"
 TAU3_SEED="${TAU3_SEED:-300}"
+TAU3_TEMPERATURE="${TAU3_TEMPERATURE:-0.6}"
+TAU3_MAX_TOKENS="${TAU3_MAX_TOKENS:-32768}"
 TAU3_RETRIEVAL_CONFIG="${TAU3_RETRIEVAL_CONFIG:-}"
 TAU3_RETRIEVAL_CONFIG_KWARGS="${TAU3_RETRIEVAL_CONFIG_KWARGS:-}"
 TAU3_VERBOSE_LOGS="${TAU3_VERBOSE_LOGS:-1}"
@@ -220,6 +223,8 @@ TAU3_NUM_TRIALS=${TAU3_NUM_TRIALS}
 TAU3_MAX_STEPS=${TAU3_MAX_STEPS}
 TAU3_MAX_ERRORS=${TAU3_MAX_ERRORS}
 TAU3_MAX_CONCURRENCY=${TAU3_MAX_CONCURRENCY}
+TAU3_TEMPERATURE=${TAU3_TEMPERATURE}
+TAU3_MAX_TOKENS=${TAU3_MAX_TOKENS}
 TAU3_RETRIEVAL_CONFIG=${TAU3_RETRIEVAL_CONFIG}
 TAU3_RETRIEVAL_CONFIG_KWARGS=${TAU3_RETRIEVAL_CONFIG_KWARGS}
 TAU2_DATA_DIR=${TAU2_DATA_DIR}
@@ -231,6 +236,7 @@ KEEP_SERVICES=${KEEP_SERVICES}
 SAMPLE_METRICS=${SAMPLE_METRICS}
 PYTHON_BIN=${PYTHON_BIN}
 THUNDERAGENT_ENV_DIR=${THUNDERAGENT_ENV_DIR}
+TAU3_ENV_DIR=${TAU3_ENV_DIR}
 VLLM_ROOT=${VLLM_ROOT}
 VLLM_ENV_DIR=${VLLM_ENV_DIR}
 VLLM_WORKDIR=${VLLM_WORKDIR}
@@ -321,6 +327,8 @@ run_tau3_official() {
     --max-concurrency "${TAU3_MAX_CONCURRENCY}"
     --seed "${TAU3_SEED}"
     --log-level INFO
+    --temperature "${TAU3_TEMPERATURE}"
+    --max-tokens "${TAU3_MAX_TOKENS}"
     --agent-llm "${AGENT_LLM}"
     --agent-base-url "http://127.0.0.1:${TA_PORT}/v1"
     --user-llm "${USER_LLM}"
@@ -345,7 +353,7 @@ main() {
   [[ -d "${TAU3_DIR}" ]] || die "tau^3 scaffold not found: ${TAU3_DIR}"
   command -v curl >/dev/null 2>&1 || die "Missing command: curl"
   command -v tee >/dev/null 2>&1 || die "Missing command: tee"
-  [[ -x "${PYTHON_BIN}" ]] || command -v "${PYTHON_BIN}" >/dev/null 2>&1 || die "Cannot find Python: ${PYTHON_BIN}"
+  [[ -x "${PYTHON_BIN}" ]] || command -v "${PYTHON_BIN}" >/dev/null 2>&1 || die "Cannot find Python: ${PYTHON_BIN}. Run: bash examples/scripts/setup_benchmark_env.sh tau3"
   [[ "${START_VLLM}" != "1" ]] || [[ -d "${VLLM_WORKDIR}" ]] || die "vLLM workdir not found: ${VLLM_WORKDIR}"
 
   export TAU2_DATA_DIR HF_ENDPOINT

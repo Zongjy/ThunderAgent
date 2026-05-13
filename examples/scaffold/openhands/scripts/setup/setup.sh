@@ -1,14 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# NOTE: If you want the venv activation to affect your current shell, run:
-#   source setup.sh
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
 
-# Create and activate env
-uv venv --python 3.12
-source .venv/bin/activate
-
-# Install OpenHands (code) in editable mode
-uv pip install vllm --torch-backend=auto
-uv pip install -e examples/scaffold/openhands
-uv pip install huggingface_hub
+# Compatibility wrapper. Prefer the repository-level setup helper so benchmark
+# environments stay isolated from one another.
+exec bash "${REPO_ROOT}/examples/scripts/setup_benchmark_env.sh" swebench

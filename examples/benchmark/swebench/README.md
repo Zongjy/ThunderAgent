@@ -13,15 +13,15 @@
 
 ```bash
 cd /raid0/liyi/ThunderAgent
-source examples/scaffold/openhands/scripts/setup/setup.sh
+bash examples/scripts/setup_benchmark_env.sh swebench
 ```
 
 默认会分开使用两个环境：
 
 - vLLM：`~/vllm/.venv/bin/vllm`
-- ThunderAgent/OpenHands：`~/ThunderAgent/.venv/bin/python`
+- ThunderAgent/OpenHands：`/raid0/liyi/ThunderAgent/.venv-openhands/bin/python`
 
-如果路径不同，改下面参数表里的 `VLLM_*` 或 `PYTHON_BIN`。
+如果路径不同，改下面参数表里的 `VLLM_*`、`OPENHANDS_ENV_DIR` 或 `PYTHON_BIN`。
 
 ## 快速运行
 
@@ -70,8 +70,9 @@ bash examples/benchmark/swebench/run_openhands_ta_default.sh
 | `SAMPLE_METRICS` | `1` | 是否采样 `/health` 和 `/metrics` |
 | `METRICS_INTERVAL_S` | `5` | 采样间隔秒数 |
 | `HEALTH_TIMEOUT_S` | `1800` | 服务启动等待超时 |
-| `THUNDERAGENT_ENV_DIR` | `~/ThunderAgent/.venv` | ThunderAgent/OpenHands 使用的虚拟环境 |
-| `PYTHON_BIN` | `~/ThunderAgent/.venv/bin/python` | 启动 ThunderAgent 和 OpenHands 的 Python |
+| `OPENHANDS_ENV_DIR` | `/raid0/liyi/ThunderAgent/.venv-openhands` | SWE-bench/OpenHands 独立 uv 环境 |
+| `THUNDERAGENT_ENV_DIR` | 同 `OPENHANDS_ENV_DIR` | 启动 ThunderAgent 的虚拟环境；默认与 benchmark env 相同 |
+| `PYTHON_BIN` | `${THUNDERAGENT_ENV_DIR}/bin/python` | 启动 ThunderAgent 和 OpenHands 的 Python |
 | `VLLM_ROOT` | `~/vllm` | vLLM 源码/环境目录 |
 | `VLLM_ENV_DIR` | `~/vllm/.venv` | vLLM 虚拟环境 |
 | `VLLM_WORKDIR` | `~/vllm` | 执行 `vllm serve` 时的工作目录 |

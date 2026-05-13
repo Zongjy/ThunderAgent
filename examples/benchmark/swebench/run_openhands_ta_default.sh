@@ -8,7 +8,8 @@ set -euo pipefail
 # ---- Configurable parameters -------------------------------------------------
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 OPENHANDS_DIR="${REPO_ROOT}/examples/scaffold/openhands"
-THUNDERAGENT_ENV_DIR="${THUNDERAGENT_ENV_DIR:-${REPO_ROOT}/.venv}"
+OPENHANDS_ENV_DIR="${OPENHANDS_ENV_DIR:-${REPO_ROOT}/.venv-openhands}"
+THUNDERAGENT_ENV_DIR="${THUNDERAGENT_ENV_DIR:-${OPENHANDS_ENV_DIR}}"
 VLLM_ROOT="${VLLM_ROOT:-${HOME}/vllm}"
 VLLM_ENV_DIR="${VLLM_ENV_DIR:-${VLLM_ROOT}/.venv}"
 VLLM_WORKDIR="${VLLM_WORKDIR:-${VLLM_ROOT}}"
@@ -169,6 +170,7 @@ METRICS_INTERVAL_S=${METRICS_INTERVAL_S}
 HEALTH_TIMEOUT_S=${HEALTH_TIMEOUT_S}
 PYTHON_BIN=${PYTHON_BIN}
 THUNDERAGENT_ENV_DIR=${THUNDERAGENT_ENV_DIR}
+OPENHANDS_ENV_DIR=${OPENHANDS_ENV_DIR}
 VLLM_ROOT=${VLLM_ROOT}
 VLLM_ENV_DIR=${VLLM_ENV_DIR}
 VLLM_WORKDIR=${VLLM_WORKDIR}
@@ -280,7 +282,7 @@ main() {
   [[ -d "${OPENHANDS_DIR}" ]] || die "OpenHands not found: ${OPENHANDS_DIR}"
   command -v curl >/dev/null 2>&1 || die "Missing command: curl"
   command -v tee >/dev/null 2>&1 || die "Missing command: tee"
-  [[ -x "${PYTHON_BIN}" ]] || command -v "${PYTHON_BIN}" >/dev/null 2>&1 || die "Cannot find ThunderAgent/OpenHands python: ${PYTHON_BIN}"
+  [[ -x "${PYTHON_BIN}" ]] || command -v "${PYTHON_BIN}" >/dev/null 2>&1 || die "Cannot find ThunderAgent/OpenHands python: ${PYTHON_BIN}. Run: bash examples/scripts/setup_benchmark_env.sh swebench"
   [[ "${START_VLLM}" != "1" ]] || [[ -d "${VLLM_WORKDIR}" ]] || die "vLLM workdir not found: ${VLLM_WORKDIR}"
   [[ "${START_VLLM}" != "1" ]] || [[ -x "${VLLM_BIN}" ]] || command -v "${VLLM_BIN}" >/dev/null 2>&1 || die "Cannot find vLLM: ${VLLM_BIN}"
 

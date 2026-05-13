@@ -6,6 +6,7 @@ the official `tau2.run_domain()` path and a thin ThunderAgent agent factory.
 ## Quick Start
 
 ```bash
+bash examples/scripts/setup_benchmark_env.sh tau3
 bash run_tau3_ta_default.sh
 ```
 
@@ -21,6 +22,12 @@ tasks in the selected split.
 TAU3_DOMAIN=retail TAU3_NUM_TASKS=5 bash run_tau3_ta_default.sh
 TAU3_DOMAIN=telecom TAU3_NUM_TASKS=5 bash run_tau3_ta_default.sh
 TAU3_DOMAIN=banking_knowledge TAU3_RETRIEVAL_CONFIG=bm25 TAU3_NUM_TASKS=3 bash run_tau3_ta_default.sh
+```
+
+Generation controls are passed through to tau2/LiteLLM:
+
+```bash
+TAU3_MAX_TOKENS=8192 TAU3_TEMPERATURE=0.3 bash run_tau3_ta_default.sh
 ```
 
 ## Local vLLM

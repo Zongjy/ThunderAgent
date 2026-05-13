@@ -1,5 +1,6 @@
 *.pyc
 .venv
+.venv-*/
 *.egg-info
 .egg-info/
 .codex
