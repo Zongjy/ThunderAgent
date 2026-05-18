@@ -38,7 +38,7 @@ bash examples/benchmark/swebench/run_openhands_ta_default.sh
 - vLLM recipe：`qwen3_coder` tool parser + `qwen3` reasoning parser + text-only
 - ThunderAgent：`127.0.0.1:9000`
 - router：`default`
-- SWE-bench Verified：100 个任务
+- SWE-bench Verified：50 个任务
 - OpenHands workers：4
 - max iterations：100
 
@@ -53,7 +53,7 @@ bash examples/benchmark/swebench/run_openhands_ta_default.sh
 | `ROUTER_MODE` | `default` | `default` 或 `tr` |
 | `SWEBENCH_DATASET` | `princeton-nlp/SWE-bench_Verified` | SWE-bench 数据集 |
 | `SWEBENCH_SPLIT` | `test` | 数据 split |
-| `SWEBENCH_LIMIT` | `100` | 任务数；`0` 表示全量 |
+| `SWEBENCH_LIMIT` | `50` | 任务数；`0` 表示全量 |
 | `SWEBENCH_WORKERS` | `4` | OpenHands 并发 worker 数 |
 | `SWEBENCH_MAX_ITERATIONS` | `100` | 每个任务最大 agent 轮数 |
 | `SWEBENCH_MODE` | `swe` | OpenHands 评测模式：`swe`、`swt`、`swt-ci` |
@@ -61,7 +61,7 @@ bash examples/benchmark/swebench/run_openhands_ta_default.sh
 | `OPENHANDS_AGENT_CONFIG` | `swe_lego_no_plan` | 写入并传给 `--agent-config` 的配置名 |
 | `OPENHANDS_ENABLE_PLAN_MODE` | `false` | 是否启用 OpenHands plan mode |
 | `OPENHANDS_NATIVE_TOOL_CALLING` | `true` | 是否使用 native tool calling；默认不走 mock function calling，也不插 ICL 示例 |
-| `OPENHANDS_LLM_TIMEOUT` | `240` | OpenHands 单次 LLM 请求超时秒数 |
+| `OPENHANDS_LLM_TIMEOUT` | `300` | OpenHands 单次 LLM 请求超时秒数 |
 | `OPENHANDS_EVAL_NOTE` | `no-hint-no-plan-no-icl` | OpenHands 输出目录中的 eval note |
 | `USE_HINT_TEXT` | `false` | 是否使用 SWE-bench hint text |
 | `START_VLLM` | `1` | 是否由脚本启动 vLLM |
@@ -78,8 +78,8 @@ bash examples/benchmark/swebench/run_openhands_ta_default.sh
 | `VLLM_WORKDIR` | `~/vllm` | 执行 `vllm serve` 时的工作目录 |
 | `VLLM_BIN` | `~/vllm/.venv/bin/vllm` | vLLM 命令路径 |
 | `HF_ENDPOINT` | `https://hf-mirror.com` | Hugging Face endpoint |
-| `GPU_MEMORY_UTILIZATION` | `0.85` | vLLM GPU 显存占比 |
-| `MAX_MODEL_LEN` | `262144` | vLLM 最大上下文长度 |
+| `GPU_MEMORY_UTILIZATION` | `0.9` | vLLM GPU 显存占比 |
+| `MAX_MODEL_LEN` | `131072` | vLLM 最大上下文长度 |
 | `ENABLE_PREFIX_CACHING` | `1` | 是否开启 prefix cache |
 | `ENABLE_VLLM_USAGE_FLAGS` | `1` | 是否开启 usage/token details |
 | `ENABLE_VLLM_TOOL_CALLING` | `1` | 是否开启 vLLM tool calling |
@@ -92,6 +92,12 @@ bash examples/benchmark/swebench/run_openhands_ta_default.sh
 | `EPOCH_DOCKER_IMAGE_PREFIX` | `ghcr.io/epoch-research` | Epoch SWE-bench 镜像前缀 |
 | `RUN_NAME` | 自动时间戳 | 本次运行名 |
 | `OUTPUT_ROOT` | `examples/benchmark/swebench/runs` | 输出根目录 |
+
+## 脚本命名
+
+- `run_openhands_ta.sh`：共享 runner，负责启动 vLLM、ThunderAgent 和 OpenHands。
+- `run_openhands_ta_default.sh`：ThunderAgent 默认调度模式 wrapper，设置 `ROUTER_MODE=default`。
+- `run_openhands_ta_tr.sh`：ThunderAgent TR 调度模式 wrapper，设置 `ROUTER_MODE=tr`。
 
 ## 例子
 
@@ -115,6 +121,13 @@ bash examples/benchmark/swebench/run_openhands_ta_default.sh
 ```bash
 SWEBENCH_LIMIT=100 SWEBENCH_WORKERS=4 \
 bash examples/benchmark/swebench/run_openhands_ta_default.sh
+```
+
+对照跑 TR 调度模式：
+
+```bash
+SWEBENCH_LIMIT=100 SWEBENCH_WORKERS=4 \
+bash examples/benchmark/swebench/run_openhands_ta_tr.sh
 ```
 
 复用已经启动的 vLLM 和 ThunderAgent：

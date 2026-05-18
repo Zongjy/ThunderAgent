@@ -323,6 +323,67 @@ def event_exit_code(event: dict[str, Any]) -> int | None:
     return safe_int(metadata.get("exit_code"))
 
 
+def parse_event_timestamp(value: Any) -> dt.datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return dt.datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def action_command(event: dict[str, Any]) -> str:
+    args = event.get("args") or {}
+    if isinstance(args, dict) and isinstance(args.get("command"), str):
+        return args["command"]
+    extras = event.get("extras") or {}
+    if isinstance(extras, dict) and isinstance(extras.get("command"), str):
+        return extras["command"]
+    return ""
+
+
+def classify_bash_command(command: str) -> str:
+    c = command.strip()
+    if "&&" in c:
+        parts = [part.strip() for part in c.split("&&")]
+        for part in reversed(parts):
+            if part and not part.startswith("cd "):
+                c = part
+                break
+    lower = c.lower()
+    first = lower.split()[0] if lower.split() else ""
+    if re.search(r"\b(pytest|tox|unittest|nosetests|npm test|mvn test|gradle test|runtests\.py)\b", lower):
+        return "test"
+    if first in {"grep", "rg", "find", "ack", "ag"} or re.search(r"\b(grep|rg|find)\b", lower):
+        return "search"
+    if first in {"cat", "sed", "head", "tail", "less", "more", "nl", "wc"}:
+        return "file_view"
+    if first in {"python", "python3", "ipython"}:
+        return "python_exec"
+    if re.search(r"\b(pip|conda|npm install|poetry install|pipenv)\b", lower):
+        return "dependency_install"
+    if first == "git":
+        return "git_patch"
+    return "other_shell"
+
+
+def swe_tool_identity(event: dict[str, Any]) -> tuple[str, str]:
+    action = str(event.get("action") or "")
+    metadata = event.get("tool_call_metadata") or {}
+    function_name = metadata.get("function_name") if isinstance(metadata, dict) else None
+    if action == "run":
+        return str(function_name or "execute_bash"), classify_bash_command(action_command(event))
+    if action == "read":
+        return str(function_name or "str_replace_editor"), "file_view"
+    if action == "edit":
+        return str(function_name or "str_replace_editor"), "file_edit"
+    if action == "think":
+        return str(function_name or "think"), "think"
+    if action == "finish":
+        return str(function_name or "finish"), "finish"
+    return str(function_name or action or "unknown"), action or "unknown"
+
+
 def analyze_history(history: Any) -> dict[str, Any]:
     if not isinstance(history, list):
         history = []
@@ -331,6 +392,11 @@ def analyze_history(history: Any) -> dict[str, Any]:
     tool_function_counts: Counter[str] = Counter()
     finish_reason_counts: Counter[str] = Counter()
     run_exit_codes: Counter[str] = Counter()
+    tool_subtype_counts: Counter[str] = Counter()
+    measured_tool_exec_values: list[float] = []
+    measured_tool_exec_by_name: dict[str, list[float]] = defaultdict(list)
+    measured_tool_exec_by_subtype: dict[str, list[float]] = defaultdict(list)
+    pending_tool_actions: dict[Any, tuple[str, str, dt.datetime]] = {}
     failed_observations = 0
     agent_tool_actions = 0
     final_agent_action = None
@@ -347,6 +413,11 @@ def analyze_history(history: Any) -> dict[str, Any]:
             final_agent_action = action
             if action not in {"system", "message"}:
                 agent_tool_actions += 1
+                tool_name, subtype = swe_tool_identity(event)
+                tool_subtype_counts[subtype] += 1
+                start_time = parse_event_timestamp(event.get("timestamp"))
+                if start_time is not None:
+                    pending_tool_actions[event.get("id")] = (tool_name, subtype, start_time)
         if observation:
             observation = str(observation)
             observation_counts[observation] += 1
@@ -356,6 +427,14 @@ def analyze_history(history: Any) -> dict[str, Any]:
                 failed_observations += 1
             if observation == "run" and exit_code is not None:
                 run_exit_codes[str(exit_code)] += 1
+            pending = pending_tool_actions.get(event.get("cause"))
+            end_time = parse_event_timestamp(event.get("timestamp"))
+            if pending is not None and end_time is not None:
+                tool_name, subtype, start_time = pending
+                latency = max(0.0, (end_time - start_time).total_seconds())
+                measured_tool_exec_values.append(latency)
+                measured_tool_exec_by_name[tool_name].append(latency)
+                measured_tool_exec_by_subtype[subtype].append(latency)
 
         metadata = event.get("tool_call_metadata") or {}
         if isinstance(metadata, dict):
@@ -376,6 +455,23 @@ def analyze_history(history: Any) -> dict[str, Any]:
         "tool_function_counts": dict(sorted(tool_function_counts.items())),
         "finish_reason_counts": dict(sorted(finish_reason_counts.items())),
         "run_exit_codes": dict(sorted(run_exit_codes.items())),
+        "tool_subtype_counts": dict(sorted(tool_subtype_counts.items())),
+        "measured_tool_exec_s": summarize_values(measured_tool_exec_values, ndigits=6),
+        "measured_tool_exec_by_name_s": {
+            name: summarize_values(values, ndigits=6)
+            for name, values in sorted(measured_tool_exec_by_name.items())
+        },
+        "measured_tool_exec_by_subtype_s": {
+            subtype: summarize_values(values, ndigits=6)
+            for subtype, values in sorted(measured_tool_exec_by_subtype.items())
+        },
+        "_measured_tool_exec_values": measured_tool_exec_values,
+        "_measured_tool_exec_by_name_values": {
+            name: values for name, values in sorted(measured_tool_exec_by_name.items())
+        },
+        "_measured_tool_exec_by_subtype_values": {
+            subtype: values for subtype, values in sorted(measured_tool_exec_by_subtype.items())
+        },
         "failed_observations": failed_observations,
         "agent_tool_actions": agent_tool_actions,
         "final_agent_action": final_agent_action,
@@ -518,6 +614,10 @@ def summarize_instances(instances: list[dict[str, Any]], eval_path: Path | None)
     tool_function_counts: Counter[str] = Counter()
     finish_reason_counts: Counter[str] = Counter()
     run_exit_codes: Counter[str] = Counter()
+    tool_subtype_counts: Counter[str] = Counter()
+    measured_tool_exec_values: list[float] = []
+    measured_tool_exec_by_name: dict[str, list[float]] = defaultdict(list)
+    measured_tool_exec_by_subtype: dict[str, list[float]] = defaultdict(list)
     for item in instances:
         hist = item.get("history") or {}
         action_counts.update(hist.get("action_counts") or {})
@@ -525,6 +625,12 @@ def summarize_instances(instances: list[dict[str, Any]], eval_path: Path | None)
         tool_function_counts.update(hist.get("tool_function_counts") or {})
         finish_reason_counts.update(hist.get("finish_reason_counts") or {})
         run_exit_codes.update(hist.get("run_exit_codes") or {})
+        tool_subtype_counts.update(hist.get("tool_subtype_counts") or {})
+        measured_tool_exec_values.extend(hist.get("_measured_tool_exec_values") or [])
+        for name, values in (hist.get("_measured_tool_exec_by_name_values") or {}).items():
+            measured_tool_exec_by_name[name].extend(values or [])
+        for subtype, values in (hist.get("_measured_tool_exec_by_subtype_values") or {}).items():
+            measured_tool_exec_by_subtype[subtype].extend(values or [])
 
     llm_calls = sum((x.get("llm") or {}).get("llm_calls", 0) for x in instances)
     prompt_tokens = sum((x.get("llm") or {}).get("prompt_tokens", 0) for x in instances)
@@ -562,8 +668,18 @@ def summarize_instances(instances: list[dict[str, Any]], eval_path: Path | None)
         "history_action_counts": dict(sorted(action_counts.items())),
         "history_observation_counts": dict(sorted(observation_counts.items())),
         "tool_function_counts": dict(sorted(tool_function_counts.items())),
+        "tool_subtype_counts": dict(sorted(tool_subtype_counts.items())),
         "finish_reason_counts": dict(sorted(finish_reason_counts.items())),
         "run_exit_codes": dict(sorted(run_exit_codes.items())),
+        "measured_tool_exec_s": summarize_values(measured_tool_exec_values, ndigits=6),
+        "measured_tool_exec_by_name_s": {
+            name: summarize_values(values, ndigits=6)
+            for name, values in sorted(measured_tool_exec_by_name.items())
+        },
+        "measured_tool_exec_by_subtype_s": {
+            subtype: summarize_values(values, ndigits=6)
+            for subtype, values in sorted(measured_tool_exec_by_subtype.items())
+        },
         "total_agent_tool_actions": tool_actions,
         "agent_tool_actions_per_instance": compact_float(tool_actions / total, 4) if total else None,
         "llm_calls": llm_calls,
@@ -1175,6 +1291,10 @@ def build_markdown(result: dict[str, Any]) -> str:
         "- `tool_call_s` is the time from one LLM response ending to the next request arriving; "
         "for this workflow it approximates tool execution plus agent/runtime overhead between LLM calls."
     )
+    lines.append(
+        "- `measured_tool_exec_s` is measured from OpenHands action timestamp to the matching observation "
+        "timestamp, grouped by benchmark-native tool subtype."
+    )
     lines.append("")
 
     logs = run["runtime_logs"]
@@ -1232,6 +1352,17 @@ def build_markdown(result: dict[str, Any]) -> str:
             f"sum={format_value((profile.get('time_breakdown_s') or {}).get('tool_call'), 1)}s, "
             f"share_of_llm_plus_tool={format_rate(eff.get('tool_call_share_of_llm_plus_tool_time'))}"
         )
+        measured = quality.get("measured_tool_exec_s") or {}
+        lines.append(
+            "- Measured tool execution: "
+            f"mean={format_value(measured.get('mean'), 3)}s, "
+            f"p95={format_value(measured.get('p95'), 3)}s, "
+            f"sum={format_value(measured.get('sum'), 1)}s"
+        )
+        lines.append(
+            "- Tool subtype counts: "
+            f"`{json.dumps(quality.get('tool_subtype_counts'), sort_keys=True)}`"
+        )
         lines.append(
             "- KV/cache profile: "
             f"avg_kv_hit={format_value((profile.get('kv_hit_rate') or {}).get('mean'), 4)}, "
@@ -1277,6 +1408,7 @@ def flatten_instances(run: dict[str, Any]) -> list[dict[str, Any]]:
         history = item.get("history") or {}
         llm = item.get("llm") or {}
         action_counts = history.get("action_counts") or {}
+        measured_tool_exec = history.get("measured_tool_exec_s") or {}
         rows.append(
             {
                 "run_name": run["run_name"],
@@ -1307,6 +1439,9 @@ def flatten_instances(run: dict[str, Any]) -> list[dict[str, Any]]:
                 "profile_steps": profile.get("steps"),
                 "profile_duration_s": profile.get("duration_s"),
                 "profile_tool_call_s": profile.get("tool_call_s"),
+                "measured_tool_exec_s": measured_tool_exec.get("sum"),
+                "measured_tool_exec_mean_s": measured_tool_exec.get("mean"),
+                "measured_tool_exec_p95_s": measured_tool_exec.get("p95"),
                 "profile_prompt_tokens": profile.get("prompt_tokens"),
                 "profile_completion_tokens": profile.get("completion_tokens"),
             }
