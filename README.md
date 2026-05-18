@@ -18,8 +18,8 @@ ThunderAgent is fast with:
 ThunderAgent is flexible and easy to use with:
 - OpenAI-compatible API passthrough with only one changing, adding `Program_id` to the sending API.
 - Multiple inference support for [vLLM](https://github.com/vllm-project/vllm) and [SGLang](https://github.com/sgl-project/sglang)
-- Scaffold examples for OpenHands, mini-swe-agent, and ToolOrchestra under [`examples/scaffold`](examples/scaffold).
-- Benchmark analysis entry points for SWE-bench and tau-bench style workloads under [`examples/benchmark`](examples/benchmark).
+- Scaffold examples for OpenHands under [`examples/scaffold`](examples/scaffold).
+- Benchmark analysis entry points for SWE-bench workloads under [`examples/benchmark`](examples/benchmark).
 - Per-program profiling for total tokens, tool-use time, pause time, and request timing.
 
 ### Overview
@@ -28,7 +28,7 @@ ThunderAgent sits between agent clients and vLLM/SGLang as an OpenAI-compatible 
 
 ### Inference & Evaluation Results
 
-ThunderAgent improves vLLM throughput by **1.5–3.6×** across diverse agentic workloads including SWE-Agent, OpenHands, and ToolOrchestra.
+ThunderAgent improves vLLM throughput by **1.5–3.6×** across diverse agentic workloads including SWE-Agent and OpenHands.
 
 ## Demo
 

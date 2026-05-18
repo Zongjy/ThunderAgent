@@ -5,7 +5,6 @@ set -euo pipefail
 #
 # Usage:
 #   bash examples/scripts/setup_benchmark_env.sh swebench
-#   bash examples/scripts/setup_benchmark_env.sh tau3
 #   bash examples/scripts/setup_benchmark_env.sh webarena
 #
 # Override the destination with ENV_DIR=/path/to/venv.
@@ -23,7 +22,6 @@ usage() {
   cat <<'EOF'
 Usage:
   bash examples/scripts/setup_benchmark_env.sh swebench
-  bash examples/scripts/setup_benchmark_env.sh tau3
   bash examples/scripts/setup_benchmark_env.sh webarena
 
 Environment overrides:
@@ -41,7 +39,6 @@ require_uv() {
 env_dir_for() {
   case "$1" in
     swebench|openhands) printf '%s/.venv-openhands' "${REPO_ROOT}" ;;
-    tau3|taubench|tau-bench) printf '%s/.venv-tau3' "${REPO_ROOT}" ;;
     webarena|browsergym) printf '%s/.venv-webarena' "${REPO_ROOT}" ;;
     *) return 1 ;;
   esac
@@ -63,14 +60,6 @@ install_openhands() {
   uv pip install --python "${env_dir}/bin/python" -e "${REPO_ROOT}/examples/scaffold/openhands"
   uv pip install --python "${env_dir}/bin/python" huggingface_hub
   log "OpenHands env ready: ${env_dir}"
-}
-
-install_tau3() {
-  local env_dir="$1"
-  install_base "${env_dir}"
-  log "Install tau2/tau3 scaffold dependencies"
-  uv pip install --python "${env_dir}/bin/python" -r "${REPO_ROOT}/examples/scaffold/tau3/requirements.txt"
-  log "tau3 env ready: ${env_dir}"
 }
 
 install_webarena() {
@@ -102,7 +91,6 @@ main() {
 
   case "${BENCHMARK}" in
     swebench|openhands) install_openhands "${env_dir}" ;;
-    tau3|taubench|tau-bench) install_tau3 "${env_dir}" ;;
     webarena|browsergym) install_webarena "${env_dir}" ;;
   esac
 

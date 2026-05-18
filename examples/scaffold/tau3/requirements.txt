@@ -1,2 +1,0 @@
-git+https://github.com/sierra-research/tau2-bench.git
-litellm>=1.80.15,<1.82.7

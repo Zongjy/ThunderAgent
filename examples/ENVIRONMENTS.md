@@ -1,15 +1,14 @@
 # Benchmark Environments
 
-Use one uv environment per benchmark scaffold. This keeps OpenHands, tau2/tau3,
-and BrowserGym/WebArena-Verified dependency constraints from fighting inside one shared
-`.venv`.
+Use one uv environment per benchmark scaffold. This keeps OpenHands and
+BrowserGym/WebArena-Verified dependency constraints from fighting inside one
+shared `.venv`.
 
 ## Recommended Layout
 
 ```text
 /raid0/liyi/ThunderAgent/
 ├── .venv-openhands    # SWE-bench + OpenHands
-├── .venv-tau3         # tau2/tau3
 ├── .venv-webarena     # BrowserGym + WebArena-Verified
 └── .venv              # optional small ThunderAgent/dev env
 
@@ -30,7 +29,6 @@ read-only cache issues from older uv cache directories.
 cd /raid0/liyi/ThunderAgent
 
 bash examples/scripts/setup_benchmark_env.sh swebench
-bash examples/scripts/setup_benchmark_env.sh tau3
 bash examples/scripts/setup_benchmark_env.sh webarena
 ```
 
@@ -48,7 +46,6 @@ The benchmark launchers now default to these envs:
 | Benchmark | Default env | Override |
 | --- | --- | --- |
 | SWE-bench/OpenHands | `.venv-openhands` | `OPENHANDS_ENV_DIR` or `PYTHON_BIN` |
-| tau2/tau3 | `.venv-tau3` | `TAU3_ENV_DIR` or `PYTHON_BIN` |
 | BrowserGym/WebArena-Verified | `.venv-webarena` | `WEBARENA_ENV_DIR` or `PYTHON_BIN` |
 
 Examples:
@@ -56,9 +53,6 @@ Examples:
 ```bash
 SWEBENCH_LIMIT=1 SWEBENCH_WORKERS=1 \
 bash examples/benchmark/swebench/run_openhands_ta_default.sh
-
-TAU3_NUM_TASKS=3 \
-bash examples/benchmark/tau3/run_tau3_ta_default.sh
 
 WEBARENA_TASK_IDS=0 WEBARENA_MAX_STEPS=5 \
 bash examples/benchmark/webarena/run_browsergym_webarena_ta_default.sh
@@ -76,7 +70,6 @@ bash examples/benchmark/webarena/run_browsergym_webarena_ta_default.sh
 | Scaffold | Dependency manifest |
 | --- | --- |
 | OpenHands | `examples/scaffold/openhands/pyproject.toml` + `uv.lock` |
-| tau2/tau3 | `examples/scaffold/tau3/requirements.txt` |
 | BrowserGym/WebArena-Verified | `examples/scaffold/browsergym_webarena/requirements.txt` |
 
 Keep benchmark-specific dependencies in those scaffold directories rather than
