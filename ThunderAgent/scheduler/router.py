@@ -37,7 +37,13 @@ class MultiBackendRouter:
     """Router with program state tracking, supports multiple backends."""
 
     @staticmethod
-    def _create_metrics_client(backend_type: str, url: str) -> MetricsClient:
+    def _create_metrics_client(
+        backend_type: str,
+        url: str,
+        *,
+        vllm_log_path: Optional[str] = None,
+        vllm_kv_capacity_tokens: Optional[int] = None,
+    ) -> MetricsClient:
         """Create a metrics client for the given backend type.
         
         Args:
@@ -48,10 +54,19 @@ class MultiBackendRouter:
             MetricsClient implementation for the backend type
         """
         if backend_type == "vllm":
-            return VLLMMetricsClient(url)
+            return VLLMMetricsClient(
+                url,
+                log_path=vllm_log_path,
+                kv_capacity_tokens=vllm_kv_capacity_tokens,
+            )
         if backend_type == "sglang":
             return SGLangMetricsClient(url)
         raise ValueError(f"Unsupported backend_type: {backend_type}")
+
+    @staticmethod
+    def _indexed_value(values: List[Any], index: int) -> Any:
+        """Return a config value matched by backend index, if present."""
+        return values[index] if index < len(values) else None
 
     def __init__(
         self, 
@@ -61,6 +76,8 @@ class MultiBackendRouter:
         scheduling_enabled: bool = True,
         scheduler_interval: float = 5.0,
         backend_type: str = "vllm",
+        vllm_log_paths: Optional[List[str]] = None,
+        vllm_kv_capacity_tokens: Optional[List[int]] = None,
         acting_token_weight: float = 1.0,
         use_acting_token_decay: bool = False,
     ) -> None:
@@ -73,8 +90,18 @@ class MultiBackendRouter:
         
         # All backends (pass acting_token_weight as tool_coefficient)
         self.backends: Dict[str, BackendState] = {}
-        for url in backend_urls:
-            metrics_client = self._create_metrics_client(backend_type, url)
+        vllm_log_paths = vllm_log_paths or []
+        vllm_kv_capacity_tokens = vllm_kv_capacity_tokens or []
+        for index, url in enumerate(backend_urls):
+            metrics_client = self._create_metrics_client(
+                backend_type,
+                url,
+                vllm_log_path=self._indexed_value(vllm_log_paths, index),
+                vllm_kv_capacity_tokens=self._indexed_value(
+                    vllm_kv_capacity_tokens,
+                    index,
+                ),
+            )
             self.backends[url] = BackendState(
                 url=url,
                 tool_coefficient=acting_token_weight,

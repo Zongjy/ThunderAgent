@@ -158,7 +158,8 @@ Returns backend metrics from all backends.
       "cache_config": {
         "block_size": 16,
         "num_gpu_blocks": 27283,
-        "total_tokens_capacity": 436528
+        "total_tokens_capacity": 436528,
+        "capacity_source": "vllm_log"
       },
       "metrics": {
         "num_requests_running": 3,

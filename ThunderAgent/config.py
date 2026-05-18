@@ -14,6 +14,10 @@ class Config:
 
     # Backend type: "vllm" or "sglang"
     backend_type: str = "vllm"
+
+    # vLLM capacity discovery. Entries are matched by backend index.
+    vllm_log_paths: List[str] = field(default_factory=list)
+    vllm_kv_capacity_tokens: List[int] = field(default_factory=list)
     
     # Profile configuration
     profile_enabled: bool = False

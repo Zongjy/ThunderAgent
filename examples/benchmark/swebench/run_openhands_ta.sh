@@ -37,6 +37,7 @@ ROUTER_MODE="${ROUTER_MODE:-default}" # default or tr
 THUNDERAGENT_BACKEND_TYPE="${THUNDERAGENT_BACKEND_TYPE:-vllm}"
 THUNDERAGENT_BACKENDS="${THUNDERAGENT_BACKENDS:-http://127.0.0.1:${VLLM_PORT}}"
 THUNDERAGENT_KV_CAPACITY_TOKENS="${THUNDERAGENT_KV_CAPACITY_TOKENS:-}"
+THUNDERAGENT_VLLM_LOG_PATHS="${THUNDERAGENT_VLLM_LOG_PATHS:-}"
 THUNDERAGENT_SCHEDULER_INTERVAL="${THUNDERAGENT_SCHEDULER_INTERVAL:-5}"
 THUNDERAGENT_ACTING_TOKEN_WEIGHT="${THUNDERAGENT_ACTING_TOKEN_WEIGHT:-1.0}"
 THUNDERAGENT_USE_ACTING_TOKEN_DECAY="${THUNDERAGENT_USE_ACTING_TOKEN_DECAY:-0}"
@@ -109,6 +110,10 @@ VLLM_LOG="${LOG_DIR}/vllm_${VLLM_PORT}.log"
 TA_LOG="${LOG_DIR}/thunderagent_${TA_PORT}_${ROUTER_MODE}.log"
 SWEBENCH_LOG="${LOG_DIR}/openhands_swebench.log"
 
+if [[ -z "${THUNDERAGENT_VLLM_LOG_PATHS}" ]]; then
+  THUNDERAGENT_VLLM_LOG_PATHS="${VLLM_LOG}"
+fi
+
 VLLM_PID=""
 TA_PID=""
 SAMPLER_PID=""
@@ -153,6 +158,36 @@ wait_url() {
     sleep 3
   done
   log "${name} ready: ${url}"
+}
+
+extract_vllm_kv_capacity() {
+  [[ -f "${VLLM_LOG}" ]] || return 1
+  local line value
+  line="$(grep -E 'GPU KV cache size: [0-9,]+ tokens' "${VLLM_LOG}" | tail -n 1 || true)"
+  [[ -n "${line}" ]] || return 1
+  value="$(sed -E 's/.*GPU KV cache size: ([0-9,]+) tokens.*/\1/' <<< "${line}" | tr -d ',')"
+  [[ -n "${value}" ]] || return 1
+  printf '%s\n' "${value}"
+}
+
+wait_vllm_kv_capacity() {
+  [[ "${THUNDERAGENT_BACKEND_TYPE}" == "vllm" ]] || return 0
+  is_enabled "${START_VLLM}" || return 0
+  [[ -z "${THUNDERAGENT_KV_CAPACITY_TOKENS}" ]] || return 0
+
+  local start now_ts capacity
+  start="$(date +%s)"
+  while true; do
+    capacity="$(extract_vllm_kv_capacity || true)"
+    if [[ -n "${capacity}" ]]; then
+      THUNDERAGENT_KV_CAPACITY_TOKENS="${capacity}"
+      log "Detected vLLM KV cache capacity: ${THUNDERAGENT_KV_CAPACITY_TOKENS} tokens"
+      return 0
+    fi
+    now_ts="$(date +%s)"
+    (( now_ts - start < HEALTH_TIMEOUT_S )) || die "vLLM KV capacity not found in log: ${VLLM_LOG}"
+    sleep 1
+  done
 }
 
 ensure_port_free() {
@@ -209,7 +244,7 @@ write_run_files() {
   write_env_manifest "${MANIFEST}" \
     REPO_ROOT OPENHANDS_DIR OPENHANDS_ENV_DIR THUNDERAGENT_ENV_DIR PYTHON_BIN \
     MODEL SERVED_MODEL_NAME VLLM_ROOT VLLM_ENV_DIR VLLM_WORKDIR VLLM_BIN VLLM_PORT TA_PORT \
-    ROUTER_MODE THUNDERAGENT_BACKEND_TYPE THUNDERAGENT_BACKENDS THUNDERAGENT_KV_CAPACITY_TOKENS \
+    ROUTER_MODE THUNDERAGENT_BACKEND_TYPE THUNDERAGENT_BACKENDS THUNDERAGENT_KV_CAPACITY_TOKENS THUNDERAGENT_VLLM_LOG_PATHS \
     THUNDERAGENT_SCHEDULER_INTERVAL THUNDERAGENT_ACTING_TOKEN_WEIGHT THUNDERAGENT_USE_ACTING_TOKEN_DECAY \
     SWEBENCH_DATASET SWEBENCH_SPLIT SWEBENCH_LIMIT SWEBENCH_WORKERS SWEBENCH_MAX_ITERATIONS SWEBENCH_MODE \
     OPENHANDS_AGENT_CLS OPENHANDS_AGENT_CONFIG OPENHANDS_ENABLE_PLAN_MODE OPENHANDS_NATIVE_TOOL_CALLING \
@@ -278,6 +313,8 @@ start_thunderagent() {
     --acting-token-weight "${THUNDERAGENT_ACTING_TOKEN_WEIGHT}"
   )
   is_enabled "${THUNDERAGENT_USE_ACTING_TOKEN_DECAY}" && cmd+=(--use-acting-token-decay)
+  [[ -n "${THUNDERAGENT_VLLM_LOG_PATHS}" ]] && cmd+=(--vllm-log-paths "${THUNDERAGENT_VLLM_LOG_PATHS}")
+  [[ -n "${THUNDERAGENT_KV_CAPACITY_TOKENS}" ]] && cmd+=(--kv-capacity-tokens "${THUNDERAGENT_KV_CAPACITY_TOKENS}")
 
   log "Start ThunderAgent router=${ROUTER_MODE}: ${TA_LOG}"
   nohup env \
@@ -285,6 +322,7 @@ start_thunderagent() {
     PATH="${THUNDERAGENT_ENV_DIR}/bin:${PATH}" \
     PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}" \
     THUNDERAGENT_KV_CAPACITY_TOKENS="${THUNDERAGENT_KV_CAPACITY_TOKENS}" \
+    THUNDERAGENT_VLLM_LOG_PATHS="${THUNDERAGENT_VLLM_LOG_PATHS}" \
     "${cmd[@]}" > "${TA_LOG}" 2>&1 &
   TA_PID="$!"
   wait_url "http://127.0.0.1:${TA_PORT}/health" "ThunderAgent"
@@ -343,6 +381,8 @@ main() {
   log "Run dir: ${RUN_DIR}"
   log "OpenHands config: ${RUN_CONFIG}"
   start_vllm
+  wait_vllm_kv_capacity
+  write_run_files
   start_thunderagent
   start_sampler
   run_swebench

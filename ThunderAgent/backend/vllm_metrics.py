@@ -1,6 +1,7 @@
 """vLLM metrics parsing, storage, and client."""
 import asyncio
 import logging
+import os
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 import re
@@ -12,17 +13,31 @@ from .metrics_base import MetricsClient
 
 logger = logging.getLogger(__name__)
 
+VLLM_KV_CAPACITY_LOG_RE = re.compile(
+    r"GPU KV cache size:\s*(?P<size>[0-9,]+)\s+tokens"
+)
+VLLM_LOG_TAIL_BYTES = 1024 * 1024
+
 
 @dataclass
 class VLLMCacheConfig:
     """Static KV cache configuration from vLLM (fetched once at startup)."""
     block_size: int = 0          # Tokens per block
     num_gpu_blocks: int = 0      # Total GPU blocks
+    total_tokens_override: int = 0
+    capacity_source: str = "cache_config_info"
     
     @property
     def total_tokens_capacity(self) -> int:
         """Total KV cache capacity in tokens."""
+        if self.total_tokens_override > 0:
+            return self.total_tokens_override
         return self.block_size * self.num_gpu_blocks
+
+    def set_total_tokens_override(self, value: int, source: str) -> None:
+        """Set an effective capacity discovered outside cache_config_info."""
+        self.total_tokens_override = value
+        self.capacity_source = source
     
     @classmethod
     def from_prometheus_text(cls, text: str) -> "VLLMCacheConfig":
@@ -44,8 +59,41 @@ class VLLMCacheConfig:
             ngb_match = re.search(r'num_gpu_blocks="(\d+)"', labels)
             if ngb_match:
                 config.num_gpu_blocks = int(ngb_match.group(1))
-        
+
         return config
+
+
+def parse_vllm_kv_capacity_from_log_text(text: str) -> Optional[int]:
+    """Parse vLLM's effective GPU KV cache capacity from startup logs."""
+    capacity = None
+    for match in VLLM_KV_CAPACITY_LOG_RE.finditer(text):
+        capacity = int(match.group("size").replace(",", ""))
+    return capacity
+
+
+def parse_positive_int(value: str, name: str) -> Optional[int]:
+    """Parse a positive integer that may contain comma separators."""
+    value = value.strip()
+    if not value:
+        return None
+    try:
+        parsed = int(value.replace(",", ""))
+    except ValueError:
+        logger.warning("Ignoring invalid %s=%r", name, value)
+        return None
+    if parsed <= 0:
+        logger.warning("Ignoring non-positive %s=%r", name, value)
+        return None
+    return parsed
+
+
+def first_csv_value(value: str) -> str:
+    """Return the first non-empty item from a comma-separated value."""
+    for item in value.split(","):
+        item = item.strip()
+        if item:
+            return item
+    return ""
 
 
 @dataclass
@@ -163,11 +211,30 @@ class VLLMMetricsClient(MetricsClient):
     metrics history management, and shared_tokens calculation.
     """
     
-    def __init__(self, url: str):
+    def __init__(
+        self,
+        url: str,
+        *,
+        kv_capacity_tokens: Optional[int] = None,
+        log_path: Optional[str] = None,
+    ):
         super().__init__(url)
         self.healthy = True
         self.metrics_history: List[VLLMMetrics] = []
         self.cache_config: Optional[VLLMCacheConfig] = None
+        self.kv_capacity_tokens = (
+            kv_capacity_tokens
+            if kv_capacity_tokens is not None
+            else parse_positive_int(
+                os.environ.get("THUNDERAGENT_KV_CAPACITY_TOKENS", ""),
+                "THUNDERAGENT_KV_CAPACITY_TOKENS",
+            )
+        )
+        self.log_path = (
+            log_path
+            or os.environ.get("THUNDERAGENT_VLLM_LOG_PATH", "").strip()
+            or first_csv_value(os.environ.get("THUNDERAGENT_VLLM_LOG_PATHS", ""))
+        )
         
         # HTTP client and monitoring state
         self._client: Optional[httpx.AsyncClient] = None
@@ -183,6 +250,46 @@ class VLLMMetricsClient(MetricsClient):
     def latest_metrics(self) -> Optional[VLLMMetrics]:
         """Get the most recent metrics sample."""
         return self.metrics_history[-1] if self.metrics_history else None
+
+    def _read_kv_capacity_from_log(self) -> Optional[int]:
+        """Read vLLM's effective KV capacity from the configured startup log."""
+        if not self.log_path:
+            return None
+        try:
+            with open(self.log_path, "rb") as f:
+                f.seek(0, os.SEEK_END)
+                size = f.tell()
+                f.seek(max(0, size - VLLM_LOG_TAIL_BYTES))
+                text = f.read().decode("utf-8", errors="replace")
+        except FileNotFoundError:
+            logger.debug("vLLM log path does not exist yet: %s", self.log_path)
+            return None
+        except OSError as exc:
+            logger.warning("Failed to read vLLM log %s: %s", self.log_path, exc)
+            return None
+        return parse_vllm_kv_capacity_from_log_text(text)
+
+    def _apply_effective_capacity(self, config: VLLMCacheConfig) -> None:
+        """Prefer vLLM's logged effective capacity over static cache_config_info."""
+        log_capacity = self._read_kv_capacity_from_log()
+        if log_capacity:
+            fallback = config.block_size * config.num_gpu_blocks
+            if fallback and fallback != log_capacity:
+                logger.info(
+                    "Using vLLM log KV capacity for %s: %s tokens "
+                    "(cache_config_info would be %s)",
+                    self.url,
+                    log_capacity,
+                    fallback,
+                )
+            config.set_total_tokens_override(log_capacity, "vllm_log")
+            return
+
+        if self.kv_capacity_tokens:
+            config.set_total_tokens_override(
+                self.kv_capacity_tokens,
+                "configured",
+            )
     
     @property
     def is_monitoring(self) -> bool:
@@ -230,6 +337,11 @@ class VLLMMetricsClient(MetricsClient):
         while not self._monitor_stop:
             try:
                 await self.fetch_metrics()
+                if (
+                    self.cache_config
+                    and self.cache_config.capacity_source != "vllm_log"
+                ):
+                    self._apply_effective_capacity(self.cache_config)
             except Exception as e:
                 logger.debug(f"Error fetching metrics from {self.url}: {e}")
             await asyncio.sleep(interval)
@@ -255,7 +367,22 @@ class VLLMMetricsClient(MetricsClient):
             resp = await client.get(self.metrics_url)
             if resp.status_code == 200:
                 self.cache_config = VLLMCacheConfig.from_prometheus_text(resp.text)
-                logger.info(f"Fetched cache config for {self.url}: block_size={self.cache_config.block_size}, num_gpu_blocks={self.cache_config.num_gpu_blocks}, total_capacity={self.cache_config.total_tokens_capacity}")
+                self._apply_effective_capacity(self.cache_config)
+                override_msg = (
+                    f", effective_capacity={self.cache_config.total_tokens_override}"
+                    if self.cache_config.total_tokens_override > 0
+                    else ""
+                )
+                logger.info(
+                    "Fetched cache config for %s: block_size=%s, "
+                    "num_gpu_blocks=%s, total_capacity=%s, source=%s%s",
+                    self.url,
+                    self.cache_config.block_size,
+                    self.cache_config.num_gpu_blocks,
+                    self.cache_config.total_tokens_capacity,
+                    self.cache_config.capacity_source,
+                    override_msg,
+                )
                 return True
             return False
         except Exception as e:
@@ -322,7 +449,12 @@ class VLLMMetricsClient(MetricsClient):
                 "block_size": self.cache_config.block_size,
                 "num_gpu_blocks": self.cache_config.num_gpu_blocks,
                 "total_tokens_capacity": self.cache_config.total_tokens_capacity,
+                "capacity_source": self.cache_config.capacity_source,
             }
+            if self.cache_config.total_tokens_override > 0:
+                result["cache_config"]["total_tokens_override"] = (
+                    self.cache_config.total_tokens_override
+                )
         # Include latest metrics (dynamic)
         if self.metrics_history:
             latest = self.latest_metrics

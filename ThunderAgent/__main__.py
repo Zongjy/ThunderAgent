@@ -1,6 +1,33 @@
 """ThunderAgent entry point for `python -m ThunderAgent`."""
 import argparse
+import os
+import re
 import sys
+
+
+def _split_csv(value: str) -> list[str]:
+    """Split a comma-separated CLI/env value."""
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def _parse_capacity_tokens(value: str) -> list[int]:
+    """Parse comma-separated positive integer token capacities."""
+    value = value.strip()
+    if not value:
+        return []
+    if re.fullmatch(r"\d{1,3}(,\d{3})+", value):
+        return [int(value.replace(",", ""))]
+
+    capacities: list[int] = []
+    for item in _split_csv(value):
+        try:
+            parsed = int(item.replace(",", ""))
+        except ValueError as exc:
+            raise ValueError(f"Invalid KV capacity token value: {item!r}") from exc
+        if parsed <= 0:
+            raise ValueError(f"KV capacity token value must be positive: {item!r}")
+        capacities.append(parsed)
+    return capacities
 
 
 def main() -> int:
@@ -17,6 +44,22 @@ def main() -> int:
                         help="Router mode: 'default' (pure proxy) or 'tr' (capacity scheduling)")
     parser.add_argument("--backend-type", default="vllm", choices=["vllm", "sglang"],
                         help="Backend type: 'vllm' or 'sglang'")
+    parser.add_argument(
+        "--vllm-log-paths",
+        default=os.environ.get("THUNDERAGENT_VLLM_LOG_PATHS", ""),
+        help=(
+            "Comma-separated vLLM log paths, matched by backend index. "
+            "Used to read the effective GPU KV cache capacity for hybrid models."
+        ),
+    )
+    parser.add_argument(
+        "--kv-capacity-tokens",
+        default=os.environ.get("THUNDERAGENT_KV_CAPACITY_TOKENS", ""),
+        help=(
+            "Comma-separated effective KV capacity token values, matched by "
+            "backend index. Used only when a vLLM log capacity is unavailable."
+        ),
+    )
     parser.add_argument("--profile", action="store_true", 
                         help="Enable profiling (track prefill/decode/tool_call times)")
     parser.add_argument("--profile-dir", default="/tmp/thunderagent_profiles", 
@@ -32,6 +75,11 @@ def main() -> int:
     parser.add_argument("--use-acting-token-decay", action="store_true",
                         help="Use 2^(-t) decay for acting tokens in resume capacity calculation")
     args = parser.parse_args()
+    try:
+        vllm_kv_capacity_tokens = _parse_capacity_tokens(args.kv_capacity_tokens)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
 
     # Set config BEFORE importing app
     from .config import Config, set_config
@@ -41,6 +89,8 @@ def main() -> int:
         backends=backends,
         router_mode=args.router,
         backend_type=args.backend_type,
+        vllm_log_paths=_split_csv(args.vllm_log_paths),
+        vllm_kv_capacity_tokens=vllm_kv_capacity_tokens,
         profile_enabled=args.profile,
         profile_dir=args.profile_dir,
         metrics_enabled=args.metrics,

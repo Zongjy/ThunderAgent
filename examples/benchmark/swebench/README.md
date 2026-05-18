@@ -66,6 +66,8 @@ bash examples/benchmark/swebench/run_openhands_ta_default.sh
 | `USE_HINT_TEXT` | `false` | 是否使用 SWE-bench hint text |
 | `START_VLLM` | `1` | 是否由脚本启动 vLLM |
 | `START_THUNDERAGENT` | `1` | 是否由脚本启动 ThunderAgent |
+| `THUNDERAGENT_VLLM_LOG_PATHS` | 本次 run 的 `vllm_*.log` | ThunderAgent 读取 vLLM `GPU KV cache size` 的日志路径；多 backend 用逗号分隔 |
+| `THUNDERAGENT_KV_CAPACITY_TOKENS` | 空 | 手工指定 KV token capacity；仅当日志中没有 capacity 时作为 fallback |
 | `KEEP_SERVICES` | `0` | 跑完后是否保留服务 |
 | `SAMPLE_METRICS` | `1` | 是否采样 `/health` 和 `/metrics` |
 | `METRICS_INTERVAL_S` | `5` | 采样间隔秒数 |

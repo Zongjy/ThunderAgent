@@ -6,7 +6,7 @@ ThunderAgent supports two inference serving backends: vLLM and SGLang. Each back
 
 | Backend | `--backend-type` | Type | Metrics Format | Capacity Source |
 |---------|-----------------|------|----------------|-----------------|
-| [vLLM](https://github.com/vllm-project/vllm) | `vllm` | Inference serving engine | Prometheus text (`/metrics`) | `block_size * num_gpu_blocks` from `cache_config_info` |
+| [vLLM](https://github.com/vllm-project/vllm) | `vllm` | Inference serving engine | Prometheus text (`/metrics`) + startup log | Effective GPU KV cache size from `GPU KV cache size: ... tokens`, with `cache_config_info` as fallback |
 | [SGLang](https://github.com/sgl-project/sglang) | `sglang` | Inference serving engine | Prometheus text (`/metrics`) + JSON (`/get_server_info`) | `max_total_num_tokens` from server info |
 
 ## Architecture
@@ -27,7 +27,9 @@ class MetricsClient(ABC):
 
 ## vLLM Backend
 
-ThunderAgent parses Prometheus text from vLLM's `/metrics` endpoint, including request counts, KV-cache utilization, prefix-cache hits, prompt/generation token totals, and preemption counters. Cache capacity is extracted from `vllm:cache_config_info`.
+ThunderAgent parses Prometheus text from vLLM's `/metrics` endpoint, including request counts, KV-cache utilization, prefix-cache hits, prompt/generation token totals, and preemption counters.
+
+For scheduling capacity, ThunderAgent prefers the effective GPU KV cache size printed in the vLLM startup log (`GPU KV cache size: ... tokens`). This is important for hybrid models where `block_size * num_gpu_blocks` from `vllm:cache_config_info` does not represent the effective token capacity. Pass log paths with `--vllm-log-paths` or `THUNDERAGENT_VLLM_LOG_PATHS`, aligned by backend index. `--kv-capacity-tokens` / `THUNDERAGENT_KV_CAPACITY_TOKENS` is still available as a manual fallback.
 
 ## SGLang Backend
 
