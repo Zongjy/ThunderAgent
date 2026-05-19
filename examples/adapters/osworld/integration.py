@@ -1,8 +1,8 @@
-"""BrowserGym-facing helpers for ThunderAgent program tracking.
+"""OSWorld-facing helpers for ThunderAgent program tracking.
 
-One BrowserGym task maps to one ThunderAgent program. OpenAI-compatible clients
+One OSWorld task maps to one ThunderAgent program. OpenAI-compatible clients
 carry that program ID through ``extra_body`` so ThunderAgent can profile and
-schedule every request belonging to the same browser episode.
+schedule every request belonging to the same desktop episode.
 """
 
 from __future__ import annotations
@@ -18,9 +18,9 @@ def prepare_openai_kwargs(
     *,
     instance_id: str,
     base_url: str | None = None,
-    scaffold: str = "browsergym-webarena",
+    scaffold: str = "osworld-agent-s",
 ) -> tuple[ThunderAgentProgram, dict[str, Any]]:
-    """Return ``(program, patched_openai_kwargs)`` for one BrowserGym task."""
+    """Return ``(program, patched_openai_kwargs)`` for one OSWorld task."""
     program = ThunderAgentProgram.create(
         instance_id=instance_id,
         scaffold=scaffold,
@@ -32,14 +32,14 @@ def prepare_openai_kwargs(
 
 
 @contextmanager
-def browsergym_instance(
+def osworld_instance(
     llm_kwargs: MutableMapping[str, Any],
     *,
     instance_id: str,
     base_url: str | None = None,
-    scaffold: str = "browsergym-webarena",
+    scaffold: str = "osworld-agent-s",
 ) -> Iterator[tuple[ThunderAgentProgram, dict[str, Any]]]:
-    """Context manager for one BrowserGym/WebArena benchmark task."""
+    """Context manager for one OSWorld/OSWorld-Verified benchmark task."""
     program, patched_kwargs = prepare_openai_kwargs(
         llm_kwargs,
         instance_id=instance_id,
