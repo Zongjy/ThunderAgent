@@ -1,8 +1,8 @@
-# BrowserGym + WebArena-Verified Benchmark
+# AgentLab + WebArena Benchmark
 
-This runner connects BrowserGym WebArena-Verified tasks to ThunderAgent. It starts
-vLLM, starts ThunderAgent, runs a small ReAct BrowserGym scaffold, and writes
-both ThunderAgent profiles and unified event traces.
+This runner uses AgentLab as the WebArena harness. AgentLab creates the
+WebArena study, runs AgentLab's browser environments, stores AgentLab traces, and
+sends LLM calls through ThunderAgent with one `program_id` per task.
 
 ## Setup
 
@@ -10,82 +10,75 @@ both ThunderAgent profiles and unified event traces.
 bash examples/scripts/setup_benchmark_env.sh webarena
 ```
 
-You also need the official WebArena self-hosted services configured for
-`browsergym-webarena-verified`.
+WebArena sites are still self-hosted. For the current shopping-only deployment,
+edit `examples/benchmark/webarena/webarena.env` so `WA_SHOPPING` points at the
+shopping service. Leave the other `WA_*` variables as `todo`; the launcher
+defaults to `WEBARENA_SITE_FILTER=shopping`.
 
-Copy the env template and edit the host:
+## Run All Shopping Tasks
 
-```bash
-cp examples/benchmark/webarena/webarena.env.example \
-  examples/benchmark/webarena/webarena.env
-```
-
-The runner loads `examples/benchmark/webarena/webarena.env` automatically. You
-can override the path with `WEBARENA_ENV_FILE=/path/to/webarena.env`.
-
-## Quick Start
+Default router:
 
 ```bash
-WEBARENA_NUM_TASKS=100 \
-WEBARENA_MAX_STEPS=5 \
-bash examples/benchmark/webarena/run_browsergym_webarena_ta_default.sh
+bash examples/benchmark/webarena/run_agentlab_webarena_default.sh
 ```
 
-For the most robust run, pass full env IDs in `WEBARENA_TASK_IDS`. If
-`WEBARENA_TASK_IDS` is not set, the runner generates original task IDs from
-`WEBARENA_TASK_START` and `WEBARENA_NUM_TASKS`; the scaffold then resolves each
-ID against BrowserGym's WebArena-Verified registry.
+TR scheduler:
+
+```bash
+bash examples/benchmark/webarena/run_agentlab_webarena_tr.sh
+```
+
+The defaults select every WebArena task whose `sites == ["shopping"]`
+(`WEBARENA_NUM_TASKS=0`). To run a smaller smoke test:
+
+```bash
+WEBARENA_TASK_IDS=21 WEBARENA_MAX_STEPS=5 \
+bash examples/benchmark/webarena/run_agentlab_webarena_default.sh
+```
 
 To reuse already running vLLM and ThunderAgent:
 
 ```bash
 START_VLLM=0 START_THUNDERAGENT=0 VLLM_PORT=4747 TA_PORT=9000 \
-WEBARENA_TASK_IDS=browsergym/webarena_verified.<intent_template_id>.<task_id>.<revision> \
-bash examples/benchmark/webarena/run_browsergym_webarena_ta_default.sh
-```
-
-Use the scheduler wrapper for `--router tr`:
-
-```bash
-START_VLLM=0 \
-WEBARENA_TASK_IDS=browsergym/webarena_verified.<intent_template_id>.<task_id>.<revision> \
-bash examples/benchmark/webarena/run_browsergym_webarena_ta_scheduler.sh
+WEBARENA_TASK_IDS=21,22,23 \
+bash examples/benchmark/webarena/run_agentlab_webarena_default.sh
 ```
 
 ## Main Parameters
 
 | Parameter | Default | Description |
 | --- | --- | --- |
-| `WEBARENA_TASK_IDS` | empty | Comma-separated WebArena-Verified task IDs. Full env IDs are safest. |
-| `WEBARENA_TASK_START` | `0` | First original WebArena task ID used when `WEBARENA_TASK_IDS` is empty. |
-| `WEBARENA_NUM_TASKS` | `1` | Number of original task IDs generated when `WEBARENA_TASK_IDS` is empty. |
-| `WEBARENA_SITE_FILTER` | empty | Optional exact site filter, such as `shopping`, used to generate matching task IDs. |
-| `WEBARENA_BENCHMARK_MODULE` | `browsergym.webarena_verified` | BrowserGym benchmark registration module. |
-| `WEBARENA_ENV_PREFIX` | `browsergym/webarena_verified` | Prefix used to resolve env IDs such as `browsergym/webarena_verified.<intent_template_id>.<task_id>.<revision>`. |
-| `WEBARENA_MAX_STEPS` | `30` | Max browser actions per task. |
-| `WEBARENA_OBSERVATION_MODE` | `axtree` | `axtree`, `dom`, or `both` prompt observation. |
-| `WEBARENA_OBSERVATION_MAX_CHARS` | `24000` | Per-observation prompt truncation. |
-| `WEBARENA_COMPACT_ACTIONS` | `0` | Set to `1` to shorten action descriptions in prompts. |
+| `WEBARENA_TASK_IDS` | empty | Comma-separated WebArena task IDs such as `21,22,23`. |
+| `WEBARENA_SITE_FILTER` | `shopping` | Exact site set used when task IDs are empty. |
+| `WEBARENA_NUM_TASKS` | `0` | Number of matching tasks; `0` means all matching tasks. |
+| `WEBARENA_TASK_START` | `0` | Offset into the matching task list. |
+| `WEBARENA_MAX_STEPS` | `100` | Max browser actions per task. |
+| `WEBARENA_MAX_CONCURRENCY` | `1` | AgentLab job count. |
+| `WEBARENA_SKIP_BACKEND_MASSAGE` | `1` | Skip AgentLab's cross-site warm-up tasks that touch non-shopping sites. |
+| `AGENTLAB_PARALLEL_BACKEND` | auto | `sequential` for one job, `ray` for more than one job. |
+| `AGENTLAB_PROGRESS_INTERVAL` | `30` | Seconds between progress updates; set `0` to disable. |
+| `WEBARENA_EVALUATOR_PROVIDER` | `none` | `none`, `stock`, or `openai-compatible` fuzzy-answer evaluator. |
 
 ## Output
 
 ```text
 examples/benchmark/webarena/runs/<run_name>/
 ├── manifest.env
-├── browsergym_outputs/
-│   ├── results.json
-│   └── traces/*.jsonl
+├── agentlab_outputs/
+│   └── <agentlab-study-dir>/
 ├── thunderagent_profiles/step_profiles.csv
-├── logs/
-│   ├── browsergym_webarena.log
-│   ├── thunderagent_health.jsonl
-│   ├── thunderagent_metrics.jsonl
-│   └── vllm_metrics.prom
-└── _analysis/
-    ├── webarena_analysis.json
-    └── webarena_events.csv
+└── logs/
+    ├── agentlab_webarena.log
+    ├── thunderagent_health.jsonl
+    ├── thunderagent_metrics.jsonl
+    └── vllm_metrics.prom
 ```
 
-Each trace follows the unified event-level schema in `.agents/task.md` with
-`llm_call`, `tool_call`, and `env_observation` events. LLM calls include the
-ThunderAgent `program_id` through OpenAI `extra_body`.
+Use AgentLab's native analysis tooling on the printed study directory:
+
+```python
+from agentlab.analyze import inspect_results
+df = inspect_results.load_result_df("/path/to/agentlab-study-dir")
+print(df.head())
+```

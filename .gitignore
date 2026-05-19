@@ -8,5 +8,6 @@
 .eval_sessions/
 outputs/
 **/runs/
+examples/benchmark/webarena/webarena.env
 .codex_tmp*/
 .agents/*
