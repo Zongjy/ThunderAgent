@@ -5,6 +5,7 @@ set -euo pipefail
 #
 # Usage:
 #   bash examples/scripts/setup_benchmark_env.sh swebench
+#   bash examples/scripts/setup_benchmark_env.sh mini-swe-agent
 #   bash examples/scripts/setup_benchmark_env.sh webarena
 #   bash examples/scripts/setup_benchmark_env.sh osworld
 #
@@ -23,6 +24,7 @@ usage() {
   cat <<'EOF'
 Usage:
   bash examples/scripts/setup_benchmark_env.sh swebench
+  bash examples/scripts/setup_benchmark_env.sh mini-swe-agent
   bash examples/scripts/setup_benchmark_env.sh webarena
   bash examples/scripts/setup_benchmark_env.sh osworld
 
@@ -42,6 +44,7 @@ require_uv() {
 env_dir_for() {
   case "$1" in
     swebench|openhands) printf '%s/.venv-openhands' "${REPO_ROOT}" ;;
+    mini-swe-agent|minisweagent) printf '%s/.venv-minisweagent' "${REPO_ROOT}" ;;
     webarena|agentlab-webarena) printf '%s/.venv-webarena' "${REPO_ROOT}" ;;
     osworld|osworld-verified) printf '%s/.venv-osworld' "${REPO_ROOT}" ;;
     *) return 1 ;;
@@ -64,6 +67,15 @@ install_openhands() {
   uv pip install --python "${env_dir}/bin/python" -e "${REPO_ROOT}/examples/scaffold/openhands"
   uv pip install --python "${env_dir}/bin/python" huggingface_hub
   log "OpenHands env ready: ${env_dir}"
+}
+
+install_minisweagent() {
+  local env_dir="$1"
+  install_base "${env_dir}"
+  log "Install mini-swe-agent SWE-bench dependencies"
+  uv pip install --python "${env_dir}/bin/python" "mini-swe-agent[full]"
+  uv pip install --python "${env_dir}/bin/python" datasets
+  log "mini-swe-agent env ready: ${env_dir}"
 }
 
 install_webarena() {
@@ -109,6 +121,7 @@ main() {
 
   case "${BENCHMARK}" in
     swebench|openhands) install_openhands "${env_dir}" ;;
+    mini-swe-agent|minisweagent) install_minisweagent "${env_dir}" ;;
     webarena|agentlab-webarena) install_webarena "${env_dir}" ;;
     osworld|osworld-verified) install_osworld "${env_dir}" ;;
   esac
