@@ -9,7 +9,6 @@ Agent frameworks that can be routed through ThunderAgent:
 | Agent | Directory | Description |
 |-------|-----------|-------------|
 | **OpenHands** | [`scaffold/openhands`](../examples/scaffold/openhands) | General software development and science discovery agent |
-| **AgentLab + WebArena** | [`scaffold/agentlab_webarena`](../examples/scaffold/agentlab_webarena) | AgentLab WebArena study scaffold with ThunderAgent-backed OpenAI calls |
 | **OSWorld + Agent-S** | [`scaffold/osworld`](../examples/scaffold/osworld) | OSWorld desktop GUI scaffold using pinned Agent-S as the agent loop |
 
 ### Quick Example: OpenHands
@@ -33,5 +32,4 @@ Benchmark modules contain launch scripts, adapters, and analysis code for studyi
 | Benchmark | Directory | Description |
 |-----------|-----------|-------------|
 | **SWE-bench** | [`benchmark/swebench`](../examples/benchmark/swebench) | OpenHands + ThunderAgent runner and tool-call/profile analysis utilities |
-| **WebArena** | [`benchmark/webarena`](../examples/benchmark/webarena) | AgentLab + WebArena runner and ThunderAgent profile capture |
 | **OSWorld-Verified** | [`benchmark/osworld_verified`](../examples/benchmark/osworld_verified) | OSWorld + Agent-S runner and computer-use trace analysis |

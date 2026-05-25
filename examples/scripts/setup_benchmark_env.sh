@@ -6,7 +6,6 @@ set -euo pipefail
 # Usage:
 #   bash examples/scripts/setup_benchmark_env.sh swebench
 #   bash examples/scripts/setup_benchmark_env.sh mini-swe-agent
-#   bash examples/scripts/setup_benchmark_env.sh webarena
 #   bash examples/scripts/setup_benchmark_env.sh osworld
 #
 # Override the destination with ENV_DIR=/path/to/venv.
@@ -15,7 +14,6 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 BENCHMARK="${1:-}"
 PYTHON_VERSION="${PYTHON_VERSION:-3.12}"
 UV_CACHE_DIR="${UV_CACHE_DIR:-/tmp/uv-cache-thunderagent}"
-INSTALL_PLAYWRIGHT="${INSTALL_PLAYWRIGHT:-1}"
 
 log() { echo "[$(date '+%F %T')] $*"; }
 die() { echo "[$(date '+%F %T')] ERROR: $*" >&2; exit 1; }
@@ -25,14 +23,12 @@ usage() {
 Usage:
   bash examples/scripts/setup_benchmark_env.sh swebench
   bash examples/scripts/setup_benchmark_env.sh mini-swe-agent
-  bash examples/scripts/setup_benchmark_env.sh webarena
   bash examples/scripts/setup_benchmark_env.sh osworld
 
 Environment overrides:
   ENV_DIR=/custom/env/path
   PYTHON_VERSION=3.12
   UV_CACHE_DIR=/tmp/uv-cache-thunderagent
-  INSTALL_PLAYWRIGHT=0   # skip browser download for webarena
   OSWORLD_SOURCE_ROOT=/path/to/OSWorld
 EOF
 }
@@ -45,7 +41,6 @@ env_dir_for() {
   case "$1" in
     swebench|openhands) printf '%s/.venv-openhands' "${REPO_ROOT}" ;;
     mini-swe-agent|minisweagent) printf '%s/.venv-minisweagent' "${REPO_ROOT}" ;;
-    webarena|agentlab-webarena) printf '%s/.venv-webarena' "${REPO_ROOT}" ;;
     osworld|osworld-verified) printf '%s/.venv-osworld' "${REPO_ROOT}" ;;
     *) return 1 ;;
   esac
@@ -78,25 +73,6 @@ install_minisweagent() {
   log "mini-swe-agent env ready: ${env_dir}"
 }
 
-install_webarena() {
-  local env_dir="$1"
-  install_base "${env_dir}"
-  log "Install AgentLab/WebArena scaffold dependencies"
-  uv pip install --python "${env_dir}/bin/python" -r "${REPO_ROOT}/examples/scaffold/agentlab_webarena/requirements.txt"
-  log "Install NLTK tokenizer data for WebArena"
-  mkdir -p "${env_dir}/nltk_data"
-  NLTK_DATA="${env_dir}/nltk_data" "${env_dir}/bin/python" - <<'PY'
-import nltk
-
-nltk.download("punkt_tab", quiet=False, raise_on_error=True)
-PY
-  if [[ "${INSTALL_PLAYWRIGHT}" == "1" ]]; then
-    log "Install Playwright Chromium browser"
-    "${env_dir}/bin/python" -m playwright install chromium
-  fi
-  log "WebArena env ready: ${env_dir}"
-}
-
 install_osworld() {
   local env_dir="$1"
   install_base "${env_dir}"
@@ -122,7 +98,6 @@ main() {
   case "${BENCHMARK}" in
     swebench|openhands) install_openhands "${env_dir}" ;;
     mini-swe-agent|minisweagent) install_minisweagent "${env_dir}" ;;
-    webarena|agentlab-webarena) install_webarena "${env_dir}" ;;
     osworld|osworld-verified) install_osworld "${env_dir}" ;;
   esac
 

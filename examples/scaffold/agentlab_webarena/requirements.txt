@@ -1,8 +1,0 @@
-agentlab==0.4.2
-gradio==5.50.0
-pydantic==2.12.0
-browsergym-core==0.14.3
-browsergym-webarena==0.14.3
-gymnasium>=1.2,<2
-nltk>=3.9,<4
-playwright==1.44
