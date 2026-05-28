@@ -7,7 +7,7 @@ Wrap one OSWorld task with `osworld_instance()` and pass the returned
 ```python
 from examples.adapters.osworld import osworld_instance
 
-llm_kwargs = {"model": "Qwen/Qwen3.5-9B", "temperature": 0}
+llm_kwargs = {"model": "qwen3.5-27B", "temperature": 0}
 
 with osworld_instance(
     llm_kwargs,

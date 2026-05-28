@@ -1,5 +1,6 @@
 """Router with program state tracking - supports multiple backends."""
 import asyncio
+import base64
 import json
 import logging
 import math
@@ -31,6 +32,15 @@ class PausedInfo:
     paused_at: float
     origin_backend: Optional[str]  # None for new programs that haven't been assigned yet
     step_count: int
+
+
+@dataclass
+class RequestTokenEstimate:
+    """Token estimate for a request before the backend returns real usage."""
+    total_tokens: int
+    text_chars: int
+    media_tokens: int
+    has_multimodal: bool
 
 
 class MultiBackendRouter:
@@ -223,7 +233,7 @@ class MultiBackendRouter:
         messages = payload.get("messages")
         if not isinstance(messages, list):
             return 0
-        
+
         parts: List[str] = []
         for msg in messages:
             if not isinstance(msg, dict) or msg.get("role") != "system":
@@ -238,12 +248,180 @@ class MultiBackendRouter:
                     text = item.get("text") or item.get("input_text")
                     if isinstance(text, str):
                         parts.append(text)
-        
+
         if not parts:
             return 0
-        
+
         text = "\n".join(parts)
         return max(0, len(text) // 5)
+
+    @staticmethod
+    def _data_uri_prefix_bytes(value: str, max_bytes: int = 65536) -> bytes:
+        """Decode only the beginning of a data URI, enough for image dimensions."""
+        if not value.startswith("data:"):
+            return b""
+        header, sep, data = value.partition(",")
+        if not sep:
+            return b""
+        if ";base64" not in header.lower():
+            return data[:max_bytes].encode("utf-8", errors="ignore")
+
+        max_chars = max(4, ((max_bytes + 2) // 3) * 4)
+        prefix = data[:max_chars]
+        prefix = prefix[: len(prefix) - (len(prefix) % 4)]
+        if not prefix:
+            return b""
+        try:
+            return base64.b64decode(prefix, validate=False)
+        except Exception:
+            return b""
+
+    @staticmethod
+    def _image_dimensions_from_prefix(prefix: bytes) -> Optional[Tuple[int, int]]:
+        """Read PNG/JPEG dimensions from a byte prefix without decoding pixels."""
+        if len(prefix) >= 24 and prefix.startswith(b"\x89PNG\r\n\x1a\n"):
+            width = int.from_bytes(prefix[16:20], "big")
+            height = int.from_bytes(prefix[20:24], "big")
+            if width > 0 and height > 0:
+                return width, height
+
+        if len(prefix) < 4 or not prefix.startswith(b"\xff\xd8"):
+            return None
+
+        i = 2
+        sof_markers = {
+            0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
+            0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF,
+        }
+        while i + 9 < len(prefix):
+            if prefix[i] != 0xFF:
+                i += 1
+                continue
+            while i < len(prefix) and prefix[i] == 0xFF:
+                i += 1
+            if i >= len(prefix):
+                break
+            marker = prefix[i]
+            i += 1
+            if marker in {0xD8, 0xD9, 0x01} or 0xD0 <= marker <= 0xD7:
+                continue
+            if i + 2 > len(prefix):
+                break
+            segment_len = int.from_bytes(prefix[i:i + 2], "big")
+            if segment_len < 2:
+                break
+            if marker in sof_markers and i + 7 < len(prefix):
+                height = int.from_bytes(prefix[i + 3:i + 5], "big")
+                width = int.from_bytes(prefix[i + 5:i + 7], "big")
+                if width > 0 and height > 0:
+                    return width, height
+            i += segment_len
+        return None
+
+    @staticmethod
+    def _estimate_image_tokens_from_dimensions(width: int, height: int) -> int:
+        """Approximate Qwen VL image tokens after 28-pixel patch merging."""
+        if width <= 0 or height <= 0:
+            return 3072
+        return max(1, math.ceil(width / 28) * math.ceil(height / 28) + 32)
+
+    @classmethod
+    def _estimate_image_tokens(cls, value: Any) -> int:
+        if isinstance(value, dict):
+            value = value.get("url") or value.get("image_url") or value.get("image")
+        if isinstance(value, str):
+            dimensions = cls._image_dimensions_from_prefix(cls._data_uri_prefix_bytes(value))
+            if dimensions:
+                return cls._estimate_image_tokens_from_dimensions(*dimensions)
+        return 3072
+
+    @staticmethod
+    def _json_chars_without_media(value: Any) -> int:
+        try:
+            return len(json.dumps(value, ensure_ascii=False, default=str))
+        except TypeError:
+            return len(str(value))
+
+    def _tokens_from_text_chars(self, chars: int) -> int:
+        if chars <= 0:
+            return 0
+        return max(1, math.ceil(chars / max(self.char_to_token_ratio, 1.0)))
+
+    def _estimate_request_tokens(self, payload: Dict[str, Any]) -> RequestTokenEstimate:
+        """Estimate prompt tokens without counting base64 image bytes as text."""
+        text_chars = 0
+        media_tokens = 0
+        has_multimodal = False
+        message_count = 0
+
+        def add_text(value: Any) -> None:
+            nonlocal text_chars
+            if isinstance(value, str):
+                text_chars += len(value)
+
+        def visit_content(content: Any) -> None:
+            nonlocal media_tokens, has_multimodal, text_chars
+            if isinstance(content, str):
+                text_chars += len(content)
+                return
+            if isinstance(content, list):
+                for item in content:
+                    if isinstance(item, str):
+                        text_chars += len(item)
+                        continue
+                    if not isinstance(item, dict):
+                        continue
+                    part_type = str(item.get("type") or "").lower()
+                    if part_type in {"text", "input_text"}:
+                        add_text(item.get("text") or item.get("input_text"))
+                    elif part_type in {"image_url", "input_image", "image"}:
+                        has_multimodal = True
+                        media_value = item.get("image_url") or item.get("image") or item.get("input_image")
+                        media_tokens += self._estimate_image_tokens(media_value)
+                    elif part_type in {"video_url", "input_video", "video"}:
+                        has_multimodal = True
+                        media_tokens += 8192
+                    else:
+                        # Preserve text-like fields while deliberately skipping media payload bytes.
+                        add_text(item.get("text") or item.get("input_text"))
+                return
+            if isinstance(content, dict):
+                visit_content([content])
+
+        messages = payload.get("messages")
+        if isinstance(messages, list):
+            for message in messages:
+                if not isinstance(message, dict):
+                    continue
+                message_count += 1
+                role = message.get("role")
+                if isinstance(role, str):
+                    text_chars += len(role)
+                visit_content(message.get("content"))
+                # If callers pass historical structured tool calls, their function
+                # names/arguments are prompt text, not media bytes.
+                if message.get("tool_calls"):
+                    text_chars += self._json_chars_without_media(message.get("tool_calls"))
+                if message.get("name"):
+                    add_text(message.get("name"))
+        else:
+            text_chars += self._json_chars_without_media(payload)
+
+        # Tool schemas and structured-output constraints are rendered into the
+        # chat template, so count them as text but keep them separate from images.
+        for key in ("tools", "tool_choice", "response_format"):
+            value = payload.get(key)
+            if value not in (None, "none", [], {}):
+                text_chars += self._json_chars_without_media(value)
+
+        overhead_tokens = max(1, message_count * 4 + 8)
+        total_tokens = self._tokens_from_text_chars(text_chars) + media_tokens + overhead_tokens
+        return RequestTokenEstimate(
+            total_tokens=max(1, int(total_tokens)),
+            text_chars=text_chars,
+            media_tokens=media_tokens,
+            has_multimodal=has_multimodal,
+        )
 
     def get_or_create_program(self, program_id: str) -> Program:
         """Get existing program or create new one.
@@ -322,9 +500,20 @@ class MultiBackendRouter:
         state.step_count += 1
         is_new_program = state.step_count == 1
         
-        # Update context_len and estimate total_tokens using char_to_token_ratio
-        state.context_len = len(json.dumps(payload, ensure_ascii=False))
-        state.total_tokens = int(state.context_len / self.char_to_token_ratio)
+        # Estimate request tokens without treating base64 media bytes as text.
+        token_estimate = self._estimate_request_tokens(payload)
+        state.context_len = token_estimate.text_chars
+        state.total_tokens = token_estimate.total_tokens
+        state.last_estimated_tokens = token_estimate.total_tokens
+        state.last_request_has_multimodal = token_estimate.has_multimodal
+        logger.debug(
+            "Estimated request tokens for %s: total=%s text_chars=%s media_tokens=%s multimodal=%s",
+            program_id,
+            token_estimate.total_tokens,
+            token_estimate.text_chars,
+            token_estimate.media_tokens,
+            token_estimate.has_multimodal,
+        )
         
         # ---------------------------------------------------------------------
         # Default mode: pure proxy, no scheduling
@@ -414,9 +603,18 @@ class MultiBackendRouter:
         state.status = ProgramStatus.ACTING
         state.acting_since = time.time()
         
-        # Update global char_to_token_ratio based on actual prefill
-        # ratio = context_len / prompt_tokens (chars per token)
-        if prompt_tokens > 0 and state.context_len > 0:
+        # Update global char_to_token_ratio from text-only requests. Multimodal
+        # prompt_tokens include image/video tokens, so using them would poison
+        # the char/token ratio for later scheduling estimates.
+        if state.last_request_has_multimodal:
+            logger.debug(
+                "Skip char_to_token_ratio update for multimodal request %s "
+                "(prompt_tokens=%s, estimated_tokens=%s)",
+                program_id,
+                prompt_tokens,
+                state.last_estimated_tokens,
+            )
+        elif prompt_tokens > 0 and state.context_len > 0:
             current_ratio = state.context_len / prompt_tokens
             if not self._ratio_initialized:
                 # First request: directly assign

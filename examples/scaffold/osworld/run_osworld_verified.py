@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
-"""Run OSWorld/OSWorld-Verified tasks through Agent-S and ThunderAgent.
+"""Run OSWorld's native Qwen3VL multi-env runner through ThunderAgent.
 
-OSWorld supplies the desktop environment, reset logic, task configs, and
-evaluator. Agent-S supplies the GUI agent loop. ThunderAgent receives one
-program_id per OSWorld task through OpenAI-compatible extra_body metadata.
+The experiment loop, multiprocessing queue, DesktopEnv lifecycle, trajectory
+logging, and evaluation are delegated to OSWorld's own
+``scripts/python/run_multienv_qwen3vl.py``.  This wrapper only:
+
+1. selects an optional task subset before invoking the native runner;
+2. forces OSWorld's Qwen3VL agent to use an OpenAI-compatible endpoint; and
+3. attaches one ThunderAgent ``program_id`` to each OSWorld task's model calls.
 """
 
 from __future__ import annotations
@@ -12,180 +16,258 @@ import argparse
 import json
 import os
 import re
-import shutil
+import runpy
 import sys
 import time
-import traceback
-from concurrent.futures import ProcessPoolExecutor, as_completed
-from dataclasses import dataclass
 from pathlib import Path
-from statistics import mean
-from typing import Any, Mapping
+from typing import Any
+from urllib.parse import urlsplit, urlunsplit
+
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+DEFAULT_MODEL = "qwen3.5-27B"
+DEFAULT_BASE_URL = "http://127.0.0.1:9000/v1"
+DEFAULT_SCAFFOLD = "osworld-native-qwen35"
+DEFAULT_HF_ENDPOINT = "https://hf-mirror.com"
 
-from examples.adapters.osworld import osworld_instance
-
-
-DOMAIN = "computer_use"
-DEFAULT_BENCHMARK = "osworld-verified"
-DEFAULT_FRAMEWORK = "agent-s-thunderagent"
-DEFAULT_SCAFFOLD = "osworld-agent-s"
-DEFAULT_AGENT_KIND = "agent-s"
-DEFAULT_AGENT_FRAMEWORKS = {
-    "agent-s": DEFAULT_FRAMEWORK,
-    "opencua": "opencua-thunderagent",
+MOUSE_ACTIONS = {
+    "mouse_move",
+    "left_click",
+    "left_click_drag",
+    "right_click",
+    "middle_click",
+    "double_click",
+    "triple_click",
 }
-DEFAULT_AGENT_SCAFFOLDS = {
-    "agent-s": DEFAULT_SCAFFOLD,
-    "opencua": "osworld-opencua",
+
+COMPUTER_USE_TOOL: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "computer_use",
+        "description": (
+            "Control an Ubuntu desktop GUI from screenshots. Use relative "
+            "coordinates on a 0..999 grid unless the caller explicitly asks "
+            "for absolute coordinates."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "description": "The next GUI action to execute.",
+                    "enum": [
+                        "key",
+                        "type",
+                        "mouse_move",
+                        "left_click",
+                        "left_click_drag",
+                        "right_click",
+                        "middle_click",
+                        "double_click",
+                        "scroll",
+                        "wait",
+                        "terminate",
+                    ],
+                },
+                "keys": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Required only when action=key.",
+                },
+                "text": {
+                    "type": "string",
+                    "description": "Required only when action=type.",
+                },
+                "coordinate": {
+                    "type": "array",
+                    "items": {"type": "number"},
+                    "minItems": 2,
+                    "maxItems": 2,
+                    "description": "Required for mouse actions: [x, y].",
+                },
+                "pixels": {
+                    "type": "number",
+                    "description": "Scroll amount for action=scroll.",
+                },
+                "time": {
+                    "type": "number",
+                    "description": "Seconds to wait for action=wait.",
+                },
+                "duration": {
+                    "type": "number",
+                    "description": "Drag duration for action=left_click_drag.",
+                },
+                "status": {
+                    "type": "string",
+                    "enum": ["success", "failure"],
+                    "description": "Completion status for action=terminate.",
+                },
+            },
+            "required": ["action"],
+            "additionalProperties": False,
+        },
+    },
 }
-PINNED_AGENT_S_VERSION = "0.3.2"
 
 
-@dataclass(frozen=True)
-class TaskSpec:
-    domain: str
-    example_id: str
-
-    @property
-    def instance_id(self) -> str:
-        return f"{self.domain}/{self.example_id}"
+def env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"", "0", "false", "no", "off"}
 
 
-@dataclass
-class AgentStepPrediction:
-    info: dict[str, Any]
-    actions: list[str]
-    latency_ms: float
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+
+    parser.add_argument(
+        "--osworld-root",
+        default=os.environ.get("OSWORLD_SOURCE_ROOT", str(Path.home() / "OSWorld")),
+        help="Path to an OSWorld checkout.",
+    )
+    parser.add_argument("--native-runner", default="")
+    parser.add_argument("--test-config-base-dir", "--test_config_base_dir", default="")
+    parser.add_argument(
+        "--test-all-meta-path",
+        "--test_all_meta_path",
+        default="",
+    )
+    parser.add_argument("--domain", default="all")
+    parser.add_argument("--task-ids", "--task_ids", default="")
+    parser.add_argument("--task-start", "--task_start", type=int, default=0)
+    parser.add_argument(
+        "--num-tasks",
+        "--num_tasks",
+        type=int,
+        default=1,
+        help="0 means all selected tasks.",
+    )
+    parser.add_argument("--output-dir", "--result-dir", "--result_dir", dest="result_dir", required=True)
+    parser.add_argument("--max-concurrency", "--num-envs", "--num_envs", dest="num_envs", type=int, default=1)
+
+    parser.add_argument("--model", default=DEFAULT_MODEL)
+    parser.add_argument("--base-url", "--base_url", default=DEFAULT_BASE_URL)
+    parser.add_argument("--api-key", "--api_key", default="EMPTY")
+    parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--top-p", "--top_p", dest="top_p", type=float, default=0.9)
+    parser.add_argument("--max-output-tokens", "--max-tokens", "--max_tokens", dest="max_tokens", type=int, default=32768)
+    parser.add_argument("--extra-body", "--extra_body", default="")
+    parser.add_argument("--scaffold", default=DEFAULT_SCAFFOLD)
+
+    # Qwen3VL-compatible names are kept because the native OSWorld agent is still
+    # the Qwen3VL computer-use scaffold; the served model can be Qwen3.5.
+    parser.add_argument("--qwen3vl-model", "--qwen35-model", dest="qwen_model", default="")
+    parser.add_argument("--qwen3vl-base-url", "--qwen35-base-url", dest="qwen_base_url", default="")
+    parser.add_argument("--qwen3vl-api-key", "--qwen35-api-key", dest="qwen_api_key", default="")
+    parser.add_argument("--qwen3vl-max-tokens", "--qwen35-max-tokens", dest="qwen_max_tokens", type=int, default=0)
+    parser.add_argument(
+        "--qwen3vl-coordinate-type",
+        "--qwen35-coordinate-type",
+        "--coord",
+        dest="coordinate_type",
+        choices=["absolute", "relative"],
+        default="relative",
+    )
+    parser.add_argument("--qwen3vl-history-n", "--qwen35-history-n", dest="history_n", type=int, default=4)
+    parser.add_argument("--qwen3vl-request-timeout", "--qwen35-request-timeout", dest="request_timeout", type=float, default=500.0)
+    parser.add_argument("--qwen3vl-max-retries", "--qwen35-max-retries", dest="max_retries", type=int, default=5)
+    parser.add_argument("--qwen3vl-thinking-budget", "--qwen35-thinking-budget", dest="thinking_budget", type=int, default=32768)
+    parser.add_argument("--qwen3vl-enable-thinking", "--qwen35-enable-thinking", dest="enable_thinking", action="store_true")
+    parser.add_argument("--qwen3vl-disable-thinking", "--qwen35-disable-thinking", dest="enable_thinking", action="store_false")
+    parser.set_defaults(enable_thinking=False)
+    parser.add_argument("--add-thought-prefix", "--add_thought_prefix", action="store_true")
+    parser.add_argument(
+        "--qwen3vl-use-vllm-tool-calls",
+        "--qwen35-use-vllm-tool-calls",
+        dest="use_vllm_tool_calls",
+        action=argparse.BooleanOptionalAction,
+        default=env_flag("QWEN3VL_USE_VLLM_TOOL_CALLS", False),
+        help="Send OpenAI tools and consume message.tool_calls from vLLM.",
+    )
+    parser.add_argument(
+        "--qwen3vl-tool-choice",
+        "--qwen35-tool-choice",
+        dest="tool_choice",
+        choices=["auto", "required", "named"],
+        default=os.environ.get("QWEN3VL_TOOL_CHOICE", "named"),
+        help="Tool choice used when native vLLM tool calls are enabled.",
+    )
+
+    parser.add_argument("--path-to-vm", "--path_to_vm", dest="path_to_vm", default=None)
+    parser.add_argument("--provider-name", "--provider_name", dest="provider_name", default="docker")
+    parser.add_argument("--region", default="us-east-1")
+    parser.add_argument("--headless", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--screen-width", "--screen_width", dest="screen_width", type=int, default=1920)
+    parser.add_argument("--screen-height", "--screen_height", dest="screen_height", type=int, default=1080)
+    parser.add_argument("--client-password", "--client_password", dest="client_password", default="")
+    parser.add_argument("--action-space", "--action_space", dest="action_space", default="pyautogui")
+    parser.add_argument(
+        "--observation-type",
+        "--observation_type",
+        dest="observation_type",
+        choices=["screenshot", "a11y_tree", "screenshot_a11y_tree", "som"],
+        default="screenshot",
+    )
+    parser.add_argument("--sleep-after-execution", "--sleep_after_execution", dest="sleep_after_execution", type=float, default=0.0)
+    parser.add_argument("--max-steps", "--max_steps", dest="max_steps", type=int, default=15)
+    parser.add_argument("--log-level", "--log_level", dest="log_level", default="INFO")
+
+    # Compatibility knobs accepted by the older ThunderAgent-local runner.  The
+    # native OSWorld Qwen3VL runner hardcodes these behaviors.
+    parser.add_argument("--agent-kind", "--agent_kind", default="qwen35")
+    parser.add_argument("--benchmark", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    parser.add_argument("--framework", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    parser.add_argument("--password", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    parser.add_argument("--snapshot-name", "--snapshot_name", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    parser.add_argument("--os-type", "--os_type", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--enable-proxy",
+        action=argparse.BooleanOptionalAction,
+        default=argparse.SUPPRESS,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument("--reset-sleep", "--reset_sleep", type=float, default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    parser.add_argument("--settle-sleep", "--settle_sleep", type=float, default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    parser.add_argument("--no-recording", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+
+    return parser.parse_args()
 
 
-@dataclass
-class EpisodeResult:
-    task_id: str
-    domain: str
-    example_id: str
-    program_id: str
-    score: float
-    success: bool
-    steps: int
-    output_dir: str
-    trace_path: str
-    error: str | None = None
+def configure_args(args: argparse.Namespace) -> argparse.Namespace:
+    if args.qwen_model:
+        args.model = args.qwen_model
+    if args.qwen_base_url:
+        args.base_url = args.qwen_base_url
+    if args.qwen_api_key:
+        args.api_key = args.qwen_api_key
+    if args.qwen_max_tokens:
+        args.max_tokens = args.qwen_max_tokens
 
+    args.osworld_root = str(Path(args.osworld_root).expanduser().resolve())
+    osworld_root = Path(args.osworld_root)
+    if not args.test_config_base_dir:
+        args.test_config_base_dir = str(osworld_root / "evaluation_examples")
+    if not args.test_all_meta_path:
+        args.test_all_meta_path = str(osworld_root / "evaluation_examples" / "test_nogdrive.json")
+    args.result_dir = str(Path(args.result_dir).expanduser().resolve())
 
-def now() -> float:
-    return time.time()
+    if args.task_start < 0:
+        raise ValueError("--task-start must be >= 0")
+    if args.num_tasks < 0:
+        raise ValueError("--num-tasks must be >= 0")
+    if args.num_envs < 1:
+        raise ValueError("--max-concurrency/--num-envs must be >= 1")
+    if args.history_n < 0:
+        raise ValueError("--qwen3vl-history-n must be >= 0")
+    if args.max_retries < 1:
+        raise ValueError("--qwen3vl-max-retries must be >= 1")
+    if args.action_space != "pyautogui":
+        raise ValueError("OSWorld Qwen3VL runner supports only pyautogui action space")
+    if args.observation_type != "screenshot":
+        raise ValueError("OSWorld Qwen3VL runner supports only screenshot observation type")
 
-
-def latency_ms(start: float, end: float) -> float:
-    return max(0.0, (end - start) * 1000.0)
-
-
-def json_size(value: Any) -> int:
-    try:
-        return len(json.dumps(value, ensure_ascii=False, default=str).encode("utf-8"))
-    except Exception:
-        return len(str(value).encode("utf-8", errors="replace"))
-
-
-def write_jsonl(path: Path, event: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(event, ensure_ascii=False, default=str) + "\n")
-
-
-def trace_event(
-    *,
-    task_id: str,
-    benchmark: str,
-    framework: str,
-    model: str,
-    step_id: int,
-    event_type: str,
-    start: float,
-    end: float,
-    program_id: str,
-    tool_name: str | None = None,
-    tool_args_size: int = 0,
-    observation_size_bytes: int = 0,
-    input_tokens: int = 0,
-    output_tokens: int = 0,
-    context_tokens: int = 0,
-    success: bool = True,
-    error_type: str | None = None,
-    state_delta: Any = None,
-) -> dict[str, Any]:
-    return {
-        "task_id": task_id,
-        "domain": DOMAIN,
-        "benchmark": benchmark,
-        "agent_framework": framework,
-        "backbone_model": model,
-        "step_id": step_id,
-        "event_type": event_type,
-        "timestamp_start": start,
-        "timestamp_end": end,
-        "latency_ms": latency_ms(start, end),
-        "input_tokens": input_tokens,
-        "output_tokens": output_tokens,
-        "context_tokens": context_tokens,
-        "tool_name": tool_name,
-        "tool_args_size": tool_args_size,
-        "observation_size": observation_size_bytes,
-        "success": success,
-        "error_type": error_type,
-        "state_delta": {"program_id": program_id, **(state_delta or {})},
-    }
-
-
-def screenshot_to_png_bytes(screenshot: Any) -> bytes:
-    if screenshot is None:
-        return b""
-    if isinstance(screenshot, bytes):
-        return screenshot
-    if isinstance(screenshot, bytearray):
-        return bytes(screenshot)
-    if isinstance(screenshot, str):
-        path = Path(screenshot)
-        if path.exists():
-            return path.read_bytes()
-        return screenshot.encode("utf-8", errors="replace")
-
-    try:
-        from PIL import Image
-    except Exception as exc:
-        raise TypeError(
-            "Screenshot is not bytes/path and Pillow is unavailable."
-        ) from exc
-
-    if isinstance(screenshot, Image.Image):
-        image = screenshot
-    else:
-        try:
-            import numpy as np
-
-            image = Image.fromarray(np.asarray(screenshot))
-        except Exception as exc:
-            raise TypeError(f"Unsupported screenshot type: {type(screenshot)!r}") from exc
-
-    import io
-
-    buffer = io.BytesIO()
-    image.save(buffer, format="PNG")
-    return buffer.getvalue()
-
-
-def observation_size(obs: dict[str, Any]) -> dict[str, int]:
-    screenshot_bytes = len(screenshot_to_png_bytes(obs.get("screenshot")))
-    text_payload = {key: value for key, value in obs.items() if key != "screenshot"}
-    return {
-        "total": screenshot_bytes + json_size(text_payload),
-        "screenshot": screenshot_bytes,
-        "metadata": json_size(text_payload),
-    }
+    safe_json_object(args.extra_body, option_name="--extra-body")
+    return args
 
 
 def safe_json_object(value: str, *, option_name: str) -> dict[str, Any]:
@@ -200,960 +282,699 @@ def safe_json_object(value: str, *, option_name: str) -> dict[str, Any]:
     return parsed
 
 
-def merge_mappings(*items: Mapping[str, Any] | None) -> dict[str, Any]:
-    merged: dict[str, Any] = {}
-    for item in items:
-        if item:
-            merged.update(dict(item))
-    return merged
-
-
-def normalize_platform(os_type: str) -> str:
-    lowered = os_type.lower()
-    if "win" in lowered:
-        return "windows"
-    if "mac" in lowered or "darwin" in lowered:
-        return "darwin"
-    return "linux"
-
-
-def normalize_agent_s_actions(actions: Any) -> list[str]:
-    if actions is None:
-        return []
-    if isinstance(actions, str):
-        candidates = [actions]
+def native_tool_system_prompt(coordinate_type: str) -> str:
+    if coordinate_type == "absolute":
+        coordinate_rule = "Use actual screenshot pixel coordinates for mouse actions."
     else:
+        coordinate_rule = "Use relative coordinates on a 0..999 by 0..999 screen grid."
+    return "\n".join(
+        [
+            "Use a mouse and keyboard to interact with a computer GUI from screenshots.",
+            coordinate_rule,
+            "For every step, call exactly one computer_use tool, including task completion.",
+            "Choose the smallest reliable UI action; wait when the screenshot has not updated yet.",
+            "When the task is complete, call computer_use with action=terminate and status=success.",
+            'Do not use the legacy JSON wrapper {"name": ..., "arguments": ...}; use the provided tool call interface.',
+            "If you include text before the tool call, keep it to one short Action line.",
+        ]
+    )
+
+
+def native_tool_choice(value: str) -> str | dict[str, Any]:
+    if value == "named":
+        return {"type": "function", "function": {"name": "computer_use"}}
+    return value
+
+
+def clone_content(content: Any) -> Any:
+    if isinstance(content, list):
+        return [dict(part) if isinstance(part, dict) else part for part in content]
+    if isinstance(content, dict):
+        return dict(content)
+    return content
+
+
+def content_to_text(content: Any) -> str:
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        chunks: list[str] = []
+        for part in content:
+            if isinstance(part, str):
+                chunks.append(part)
+            elif isinstance(part, dict):
+                if part.get("type") == "text":
+                    chunks.append(str(part.get("text", "")))
+                elif "text" in part:
+                    chunks.append(str(part.get("text", "")))
+        return "\n".join(chunk for chunk in chunks if chunk)
+    return str(content)
+
+
+def text_content(text: str) -> list[dict[str, str]]:
+    return [{"type": "text", "text": text}]
+
+
+def first_action_line(text: str) -> str:
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or (stripped.startswith("<") and stripped.endswith(">")):
+            continue
+        if stripped.lower().startswith("action:"):
+            return stripped.split(":", 1)[1].strip()
+        return stripped
+    return ""
+
+
+def parse_jsonish(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    stripped = value.strip()
+    if not stripped:
+        return value
+    if stripped[0] not in '[{"-0123456789tfn':
+        return value
+    try:
+        return json.loads(stripped)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return value
+
+
+def parse_numeric(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    stripped = value.strip()
+    try:
+        parsed = float(stripped)
+    except ValueError:
+        return value
+    return int(parsed) if parsed.is_integer() else parsed
+
+
+def parse_tool_parameter_value(name: str, raw_value: str) -> Any:
+    value = raw_value
+    if value.startswith("\n"):
+        value = value[1:]
+    if value.endswith("\n"):
+        value = value[:-1]
+    if name in {"coordinate", "keys"}:
+        return parse_jsonish(value.strip())
+    if name in {"pixels", "time", "duration"}:
+        return parse_numeric(value.strip())
+    if name in {"action", "status"}:
+        return value.strip()
+    return value
+
+
+def normalize_tool_arguments(raw_args: Any) -> dict[str, Any]:
+    if isinstance(raw_args, str):
+        parsed = parse_jsonish(raw_args)
+        args = parsed if isinstance(parsed, dict) else {"text": raw_args}
+    elif isinstance(raw_args, dict):
+        args = dict(raw_args)
+    else:
+        args = {}
+
+    if isinstance(args.get("parameters"), dict) and "action" not in args:
+        args = dict(args["parameters"])
+
+    action = args.get("action")
+    nested = args.get("arguments")
+    if isinstance(nested, dict):
+        args.pop("arguments", None)
+        args.update(nested)
+    elif isinstance(nested, list):
+        args.pop("arguments", None)
+        if action in MOUSE_ACTIONS and "coordinate" not in args:
+            args["coordinate"] = nested
+    elif isinstance(nested, str):
+        args.pop("arguments", None)
+        parsed_nested = parse_jsonish(nested)
+        if action in MOUSE_ACTIONS and "coordinate" not in args:
+            args["coordinate"] = parsed_nested
+        elif action == "key" and "keys" not in args:
+            args["keys"] = parsed_nested
+        elif action == "type" and "text" not in args:
+            args["text"] = nested
+        elif action == "scroll" and "pixels" not in args:
+            args["pixels"] = parse_numeric(nested)
+        elif action == "wait" and "time" not in args:
+            args["time"] = parse_numeric(nested)
+        elif action == "terminate" and "status" not in args:
+            args["status"] = nested.strip()
+
+    if "coordinate" in args:
+        args["coordinate"] = parse_jsonish(args["coordinate"])
+    if "keys" in args:
+        keys = parse_jsonish(args["keys"])
+        args["keys"] = keys if isinstance(keys, list) else [str(keys)]
+    for numeric_name in ("pixels", "time", "duration"):
+        if numeric_name in args:
+            args[numeric_name] = parse_numeric(args[numeric_name])
+
+    return {key: value for key, value in args.items() if value is not None}
+
+
+def format_parameter_value(value: Any) -> str:
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False)
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if value is None:
+        return "null"
+    return str(value)
+
+
+def tool_call_to_qwen_xml(name: str, args: dict[str, Any]) -> str:
+    lines = ["<tool_call>", f"<function={name}>"]
+    for key, value in args.items():
+        lines.extend(
+            [
+                f"<parameter={key}>",
+                format_parameter_value(value),
+                "</parameter>",
+            ]
+        )
+    lines.extend(["</function>", "</tool_call>"])
+    return "\n".join(lines)
+
+
+def extract_legacy_tool_calls(text: str) -> list[dict[str, Any]]:
+    calls: list[dict[str, Any]] = []
+    for match in re.finditer(r"<tool_call>\s*(.*?)\s*</tool_call>", text, re.DOTALL):
         try:
-            candidates = list(actions)
-        except TypeError:
-            candidates = [str(actions)]
-    normalized = [str(action).strip() for action in candidates if str(action).strip()]
-    return normalized
+            payload = json.loads(match.group(1))
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict) and "arguments" in payload:
+            calls.append(payload)
+    if calls:
+        return calls
+    stripped = text.strip()
+    if stripped.startswith("{") and stripped.endswith("}"):
+        try:
+            payload = json.loads(stripped)
+        except json.JSONDecodeError:
+            return calls
+        if isinstance(payload, dict) and "arguments" in payload:
+            calls.append(payload)
+    return calls
 
 
-def tool_name_from_action(action: str) -> str:
-    if action in {"WAIT", "DONE", "FAIL"}:
-        return action
-    match = re.search(r"\bpyautogui\.(\w+)\s*\(", action)
-    return match.group(1) if match else "pyautogui"
+def legacy_tool_response_to_qwen_xml(text: str) -> str:
+    calls = extract_legacy_tool_calls(text)
+    if not calls:
+        return text
+    parts: list[str] = []
+    action_line = first_action_line(text)
+    if action_line:
+        parts.append(f"Action: {action_line}")
+    for call in calls:
+        name = str(call.get("name") or "computer_use")
+        args = normalize_tool_arguments(call.get("arguments", {}))
+        parts.append(tool_call_to_qwen_xml(name, args))
+    return "\n".join(parts)
 
 
-def validate_agent_s_version(strict: bool) -> str:
-    try:
-        from importlib.metadata import PackageNotFoundError, version
-    except ImportError:  # pragma: no cover - Python 3.10+ in this project
-        from importlib_metadata import PackageNotFoundError, version  # type: ignore
-
-    try:
-        installed = version("gui-agents")
-    except PackageNotFoundError as exc:
-        raise RuntimeError(
-            "Agent-S is not installed. Install the pinned dependency with: "
-            "OSWORLD_SOURCE_ROOT=/path/to/OSWorld "
-            "bash examples/scripts/setup_benchmark_env.sh osworld"
-        ) from exc
-    if strict and installed != PINNED_AGENT_S_VERSION:
-        raise RuntimeError(
-            f"Agent-S version mismatch: expected gui-agents=={PINNED_AGENT_S_VERSION}, "
-            f"found {installed}."
-        )
-    return installed
-
-
-def install_agent_s_thunderagent_patch() -> None:
-    """Inject ThunderAgent program_id into Agent-S OpenAI-compatible engines."""
-    import gui_agents.s3.core.engine as engine_mod
-    from ThunderAgent.adapters import inject_program_id
-
-    if getattr(engine_mod, "_thunderagent_program_id_patch", False):
-        return
-
-    original_openai_init = engine_mod.LMMEngineOpenAI.__init__
-    original_openai_generate = engine_mod.LMMEngineOpenAI.generate
-
-    def openai_init(self: Any, *args: Any, **kwargs: Any) -> None:
-        self._thunderagent_extra_body = dict(kwargs.pop("extra_body", {}) or {})
-        self._thunderagent_max_new_tokens = kwargs.pop(
-            "max_new_tokens", kwargs.pop("max_tokens", None)
-        )
-        self._thunderagent_top_p = kwargs.pop("top_p", None)
-        original_openai_init(self, *args, **kwargs)
-
-    def openai_generate(
-        self: Any,
-        messages: Any,
-        temperature: float = 0.0,
-        max_new_tokens: int | None = None,
-        **kwargs: Any,
-    ) -> str:
-        request_extra_body = kwargs.pop("extra_body", None)
-        extra_body = merge_mappings(
-            getattr(self, "_thunderagent_extra_body", None),
-            request_extra_body if isinstance(request_extra_body, Mapping) else None,
-        )
-        injected_extra_body = inject_program_id(extra_body)
-        if injected_extra_body:
-            kwargs["extra_body"] = injected_extra_body
-
-        effective_max_tokens = (
-            max_new_tokens
-            if max_new_tokens is not None
-            else getattr(self, "_thunderagent_max_new_tokens", None)
-        )
-        if (
-            effective_max_tokens
-            and "max_tokens" not in kwargs
-            and "max_completion_tokens" not in kwargs
+def parse_qwen_xml_tool_calls(text: str) -> list[dict[str, Any]]:
+    calls: list[dict[str, Any]] = []
+    for function_match in re.finditer(
+        r"<function=([^>\n]+)>\s*(.*?)\s*</function>", text, re.DOTALL
+    ):
+        name = function_match.group(1).strip()
+        body = function_match.group(2)
+        args: dict[str, Any] = {}
+        for param_match in re.finditer(
+            r"<parameter=([^>\n]+)>(.*?)(?:</parameter>|(?=<parameter=)|(?=</function>)|$)",
+            body,
+            re.DOTALL,
         ):
-            kwargs["max_tokens"] = int(effective_max_tokens)
-
-        top_p = getattr(self, "_thunderagent_top_p", None)
-        if top_p is not None and "top_p" not in kwargs:
-            kwargs["top_p"] = float(top_p)
-
-        return original_openai_generate(
-            self,
-            messages,
-            temperature=temperature,
-            max_new_tokens=effective_max_tokens,
-            **kwargs,
-        )
-
-    original_vllm_init = engine_mod.LMMEnginevLLM.__init__
-
-    def vllm_init(self: Any, *args: Any, **kwargs: Any) -> None:
-        self._thunderagent_extra_body = dict(kwargs.pop("extra_body", {}) or {})
-        self._thunderagent_max_new_tokens = kwargs.pop(
-            "max_new_tokens", kwargs.pop("max_tokens", None)
-        )
-        self._thunderagent_top_p = kwargs.pop("top_p", None)
-        original_vllm_init(self, *args, **kwargs)
-
-    def vllm_generate(
-        self: Any,
-        messages: Any,
-        temperature: float = 0.0,
-        top_p: float = 0.8,
-        repetition_penalty: float = 1.05,
-        max_new_tokens: int | None = 512,
-        **kwargs: Any,
-    ) -> str:
-        api_key = (
-            self.api_key
-            or os.getenv("vLLM_API_KEY")
-            or os.getenv("OPENAI_API_KEY")
-            or "EMPTY"
-        )
-        base_url = self.base_url or os.getenv("vLLM_ENDPOINT_URL")
-        if base_url is None:
-            raise ValueError(
-                "A vLLM endpoint URL must be provided through base_url or "
-                "vLLM_ENDPOINT_URL."
+            param_name = param_match.group(1).strip()
+            args[param_name] = parse_tool_parameter_value(
+                param_name, param_match.group(2)
             )
-        if not self.llm_client:
-            self.llm_client = engine_mod.OpenAI(base_url=base_url, api_key=api_key)
+        calls.append({"name": name, "arguments": normalize_tool_arguments(args)})
+    return calls
 
-        effective_top_p = getattr(self, "_thunderagent_top_p", None)
-        if effective_top_p is None:
-            effective_top_p = top_p
-        configured_max_tokens = getattr(self, "_thunderagent_max_new_tokens", None)
-        effective_max_tokens = (
-            max_new_tokens
-            if max_new_tokens is not None
-            else configured_max_tokens
-            if configured_max_tokens is not None
-            else 4096
+
+def tool_call_object_parts(tool_call: Any) -> tuple[str, Any]:
+    function = getattr(tool_call, "function", None)
+    if function is None and isinstance(tool_call, dict):
+        function = tool_call.get("function")
+    if isinstance(function, dict):
+        return str(function.get("name") or ""), function.get("arguments")
+    return str(getattr(function, "name", "") or ""), getattr(function, "arguments", None)
+
+
+def legacy_response_from_calls(calls: list[dict[str, Any]], content: str = "") -> str:
+    blocks: list[str] = []
+    first_action = ""
+    for call in calls:
+        name = str(call.get("name") or "computer_use")
+        args = normalize_tool_arguments(call.get("arguments", {}))
+        if not args.get("action"):
+            continue
+        if not first_action:
+            first_action = str(args.get("action"))
+        payload = {"name": name, "arguments": args}
+        blocks.append(
+            "<tool_call>\n"
+            + json.dumps(payload, ensure_ascii=False)
+            + "\n</tool_call>"
         )
-
-        request_extra_body = kwargs.pop("extra_body", None)
-        extra_body = merge_mappings(
-            {"repetition_penalty": repetition_penalty},
-            getattr(self, "_thunderagent_extra_body", None),
-            request_extra_body if isinstance(request_extra_body, Mapping) else None,
-        )
-        completion = self.llm_client.chat.completions.create(
-            model=self.model,
-            messages=messages,
-            max_tokens=int(effective_max_tokens),
-            temperature=self.temperature if self.temperature is not None else temperature,
-            top_p=float(effective_top_p),
-            extra_body=inject_program_id(extra_body),
-            **kwargs,
-        )
-        return completion.choices[0].message.content
-
-    engine_mod.LMMEngineOpenAI.__init__ = openai_init
-    engine_mod.LMMEngineOpenAI.generate = openai_generate
-    engine_mod.LMMEnginevLLM.__init__ = vllm_init
-    engine_mod.LMMEnginevLLM.generate = vllm_generate
-    engine_mod._thunderagent_program_id_patch = True
+    if not blocks:
+        return ""
+    action_line = first_action_line(content) or first_action
+    return "\n".join([f"Action: {action_line}", *blocks])
 
 
-def agent_s_engine_params(
-    args: argparse.Namespace,
-    *,
-    role: str,
-    extra_body: Mapping[str, Any] | None,
-) -> dict[str, Any]:
-    prefix = f"agent_s_{role}_"
-    engine_type = getattr(args, f"{prefix}engine_type") or args.agent_s_engine_type
-    model = getattr(args, f"{prefix}model") or args.model
-    base_url = getattr(args, f"{prefix}base_url") or args.base_url
-    api_key = getattr(args, f"{prefix}api_key") or args.api_key
-    role_extra_body = safe_json_object(
-        getattr(args, f"{prefix}extra_body") or "",
-        option_name=f"--agent-s-{role}-extra-body",
-    )
-
-    params: dict[str, Any] = {
-        "engine_type": engine_type,
-        "model": model,
-        "temperature": args.temperature,
-        "top_p": args.top_p,
-        "max_new_tokens": args.max_output_tokens,
-        "extra_body": merge_mappings(extra_body, role_extra_body),
-    }
-    if base_url:
-        params["base_url"] = base_url
-    if api_key:
-        params["api_key"] = api_key
-
-    if role == "grounding":
-        params["grounding_width"] = args.agent_s_grounding_width
-        params["grounding_height"] = args.agent_s_grounding_height
-
-    return params
+def tool_calls_to_legacy_response(tool_calls: Any, content: str = "") -> str:
+    calls: list[dict[str, Any]] = []
+    for tool_call in tool_calls or []:
+        name, raw_args = tool_call_object_parts(tool_call)
+        if not name:
+            continue
+        calls.append({"name": name, "arguments": normalize_tool_arguments(raw_args)})
+    return legacy_response_from_calls(calls, content)
 
 
-class AgentSOSWorldAgent:
-    """Thin wrapper around Agent-S3 for one OSWorld episode."""
-
-    def __init__(
-        self,
-        *,
-        env: Any,
-        args: argparse.Namespace,
-        extra_body: Mapping[str, Any] | None,
-    ) -> None:
-        validate_agent_s_version(args.agent_s_strict_version)
-        install_agent_s_thunderagent_patch()
-
-        from gui_agents.s3.agents.agent_s import AgentS3
-        from gui_agents.s3.agents.grounding import OSWorldACI
-
-        self.platform = normalize_platform(args.os_type)
-        self.screen_width = args.screen_width
-        self.screen_height = args.screen_height
-
-        main_engine_params = agent_s_engine_params(
-            args,
-            role="main",
-            extra_body=extra_body,
-        )
-        grounding_engine_params = agent_s_engine_params(
-            args,
-            role="grounding",
-            extra_body=extra_body,
-        )
-        code_engine_params = (
-            agent_s_engine_params(args, role="code", extra_body=extra_body)
-            if args.agent_s_enable_code_agent
-            else None
-        )
-        aci_env = env if args.agent_s_enable_code_agent else None
-
-        grounding_agent = OSWorldACI(
-            env=aci_env,
-            platform=self.platform,
-            engine_params_for_generation=main_engine_params,
-            engine_params_for_grounding=grounding_engine_params,
-            width=self.screen_width,
-            height=self.screen_height,
-            code_agent_budget=args.agent_s_code_agent_budget,
-            code_agent_engine_params=code_engine_params,
-        )
-        self.agent = AgentS3(
-            main_engine_params,
-            grounding_agent,
-            platform=self.platform,
-            max_trajectory_length=args.agent_s_max_trajectory_length,
-            enable_reflection=args.agent_s_enable_reflection,
-        )
-
-    def predict(self, *, instruction: str, obs: dict[str, Any]) -> AgentStepPrediction:
-        screenshot = screenshot_to_png_bytes(obs.get("screenshot"))
-        agent_obs = dict(obs)
-        agent_obs["screenshot"] = screenshot
-
-        start = now()
-        info, actions = self.agent.predict(instruction=instruction, observation=agent_obs)
-        end = now()
-        normalized_actions = normalize_agent_s_actions(actions)
-        if not normalized_actions:
-            normalized_actions = ["FAIL"]
-        return AgentStepPrediction(
-            info=dict(info or {}),
-            actions=normalized_actions,
-            latency_ms=latency_ms(start, end),
-        )
+def qwen_xml_content_to_legacy_response(content: str) -> str:
+    return legacy_response_from_calls(parse_qwen_xml_tool_calls(content), content)
 
 
-def ensure_osworld_on_path(osworld_root: str) -> None:
-    if osworld_root:
-        path = Path(osworld_root).expanduser().resolve()
-        if not path.exists():
-            raise FileNotFoundError(
-                f"OSWorld source root not found: {path}. Set --osworld-root."
+def prepare_messages_for_native_tool_calls(
+    messages: list[dict[str, Any]], coordinate_type: str
+) -> list[dict[str, Any]]:
+    prepared: list[dict[str, Any]] = []
+    saw_system = False
+    for message in messages:
+        copied = {key: clone_content(value) for key, value in message.items()}
+        role = copied.get("role")
+        if role == "system":
+            copied["content"] = text_content(native_tool_system_prompt(coordinate_type))
+            saw_system = True
+        elif role == "assistant":
+            copied["content"] = text_content(
+                legacy_tool_response_to_qwen_xml(content_to_text(copied.get("content")))
             )
-        if str(path) not in sys.path:
-            sys.path.insert(0, str(path))
+        prepared.append(copied)
+    if not saw_system:
+        prepared.insert(
+            0,
+            {
+                "role": "system",
+                "content": text_content(native_tool_system_prompt(coordinate_type)),
+            },
+        )
+    return prepared
 
 
-def maybe_load_dotenv(osworld_root: str) -> None:
-    try:
-        from dotenv import load_dotenv
-    except Exception:
-        return
-    for path in (Path.cwd() / ".env", Path(osworld_root) / ".env" if osworld_root else None):
-        if path and path.exists():
-            load_dotenv(path)
-
-
-def import_desktop_env(osworld_root: str) -> Any:
-    ensure_osworld_on_path(osworld_root)
-    try:
-        from desktop_env.desktop_env import DesktopEnv
-    except ModuleNotFoundError as exc:
-        raise ModuleNotFoundError(
-            "Cannot import OSWorld desktop_env. Clone OSWorld and pass "
-            "--osworld-root, or add the checkout to PYTHONPATH. "
-            f"Underlying missing module: {exc.name or exc}."
-        ) from exc
-    return DesktopEnv
-
-
-def resolve_aws_snapshot_name(args: argparse.Namespace) -> str | None:
-    if args.snapshot_name:
-        return args.snapshot_name
-    if args.provider_name != "aws":
-        return None
-    try:
-        from desktop_env.providers.aws.manager import IMAGE_ID_MAP
-    except Exception:
-        return None
-    screen_size = (args.screen_width, args.screen_height)
-    region_map = IMAGE_ID_MAP.get(args.region, {})
-    return region_map.get(screen_size) or region_map.get((1920, 1080))
-
-
-def create_desktop_env(args: argparse.Namespace) -> Any:
-    DesktopEnv = import_desktop_env(args.osworld_root)
-    snapshot_name = resolve_aws_snapshot_name(args)
-    kwargs = {
-        "path_to_vm": args.path_to_vm or None,
-        "action_space": args.action_space,
-        "provider_name": args.provider_name,
-        "region": args.region,
-        "screen_size": (args.screen_width, args.screen_height),
-        "headless": args.headless,
-        "os_type": args.os_type,
-        "require_a11y_tree": args.observation_type
-        in {"a11y_tree", "screenshot_a11y_tree", "som"},
-        "enable_proxy": args.enable_proxy,
-        "client_password": args.client_password,
-    }
-    if snapshot_name:
-        kwargs["snapshot_name"] = snapshot_name
-    return DesktopEnv(**kwargs)
-
-
-def task_config_path(args: argparse.Namespace, task: TaskSpec) -> Path:
-    return (
-        Path(args.test_config_base_dir)
-        / "examples"
-        / task.domain
-        / f"{task.example_id}.json"
-    )
-
-
-def load_task_config(args: argparse.Namespace, task: TaskSpec) -> dict[str, Any]:
-    path = task_config_path(args, task)
-    if not path.exists():
-        raise FileNotFoundError(f"OSWorld task config not found: {path}")
-    with path.open(encoding="utf-8") as handle:
-        return json.load(handle)
-
-
-def maybe_start_recording(env: Any) -> None:
-    controller = getattr(env, "controller", None)
-    if controller is None or not hasattr(controller, "start_recording"):
-        return
-    try:
-        controller.start_recording()
-    except Exception:
-        pass
-
-
-def maybe_end_recording(env: Any, path: Path) -> None:
-    controller = getattr(env, "controller", None)
-    if controller is None or not hasattr(controller, "end_recording"):
-        return
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        controller.end_recording(str(path))
-    except Exception:
-        pass
-
-
-def reset_env(env: Any, task_config: dict[str, Any], *, reset_sleep: float) -> dict[str, Any]:
-    output = env.reset(task_config=task_config)
-    if reset_sleep > 0:
-        time.sleep(reset_sleep)
-    if isinstance(output, dict) and "screenshot" in output:
-        return output
-    return env._get_obs()
-
-
-def step_env(
-    env: Any,
-    action: str,
-    *,
-    sleep_after_execution: float,
-) -> tuple[dict[str, Any], float, bool, dict[str, Any]]:
-    output = env.step(action, sleep_after_execution)
-    if isinstance(output, tuple):
-        if len(output) == 4:
-            obs, reward, done, info = output
-            return obs, float(reward or 0.0), bool(done), dict(info or {})
-        if len(output) == 5:
-            obs, reward, terminated, truncated, info = output
-            return obs, float(reward or 0.0), bool(terminated or truncated), dict(info or {})
-    obs = env._get_obs()
-    return obs, 0.0, action in {"DONE", "FAIL"}, {}
-
-
-def evaluate_env(env: Any) -> float:
-    result = env.evaluate()
-    if isinstance(result, bool):
-        return 1.0 if result else 0.0
-    try:
-        return float(result)
-    except Exception:
-        return 0.0
-
-
-def run_one_task(
-    *,
-    env: Any,
-    args: argparse.Namespace,
-    task: TaskSpec,
-) -> EpisodeResult:
-    task_id = task.instance_id
-    task_output_dir = Path(args.output_dir) / task.domain / task.example_id
-    trace_path = Path(args.output_dir) / "traces" / f"{task.domain}__{task.example_id}.jsonl"
-    traj_path = task_output_dir / "traj.jsonl"
-    result_path = task_output_dir / "result.json"
-    recording_path = task_output_dir / "recording.mp4"
-    task_output_dir.mkdir(parents=True, exist_ok=True)
-    if trace_path.exists():
-        trace_path.unlink()
-    if traj_path.exists():
-        traj_path.unlink()
-
-    program_id = ""
-    score = 0.0
-    step_count = 0
-    error: str | None = None
-
-    llm_kwargs: dict[str, Any] = {}
-    extra_body = safe_json_object(args.extra_body, option_name="--extra-body")
-    if extra_body:
-        llm_kwargs["extra_body"] = extra_body
-
-    with osworld_instance(
-        llm_kwargs,
-        instance_id=task_id,
-        base_url=args.base_url,
-        scaffold=args.scaffold,
-    ) as (program, patched_llm_kwargs):
-        program_id = program.program_id
-        try:
-            agent = AgentSOSWorldAgent(
-                env=env,
-                args=args,
-                extra_body=patched_llm_kwargs.get("extra_body"),
-            )
-            task_config = load_task_config(args, task)
-            instruction = str(task_config.get("instruction", ""))
-            if not args.no_recording:
-                maybe_start_recording(env)
-            reset_start = now()
-            obs = reset_env(env, task_config, reset_sleep=args.reset_sleep)
-            reset_end = now()
-            obs_sizes = observation_size(obs)
-            write_jsonl(
-                trace_path,
-                trace_event(
-                    task_id=task_id,
-                    benchmark=args.benchmark,
-                    framework=args.framework,
-                    model=args.model,
-                    step_id=0,
-                    event_type="env_observation",
-                    start=reset_start,
-                    end=reset_end,
-                    program_id=program_id,
-                    observation_size_bytes=obs_sizes["total"],
-                    state_delta={
-                        "phase": "reset",
-                        "obs_sizes": obs_sizes,
-                        "instruction": instruction,
-                        "agent_s_version": PINNED_AGENT_S_VERSION,
-                    },
-                ),
-            )
-
-            done = False
-            for step_id in range(1, args.max_steps + 1):
-                predict_start = now()
-                prediction = agent.predict(instruction=instruction, obs=obs)
-                predict_end = now()
-                write_jsonl(
-                    trace_path,
-                    trace_event(
-                        task_id=task_id,
-                        benchmark=args.benchmark,
-                        framework=args.framework,
-                        model=args.model,
-                        step_id=step_id,
-                        event_type="llm_call",
-                        start=predict_start,
-                        end=predict_end,
-                        program_id=program_id,
-                        state_delta={
-                            "agent_s_info": prediction.info,
-                            "actions": prediction.actions,
-                            "agent_s_version": PINNED_AGENT_S_VERSION,
-                        },
-                    ),
-                )
-                write_jsonl(
-                    traj_path,
-                    {
-                        "step": step_id,
-                        "instruction": instruction,
-                        "agent_s_info": prediction.info,
-                        "actions": prediction.actions,
-                        "latency_ms": prediction.latency_ms,
-                    },
-                )
-
-                for action in prediction.actions:
-                    action_start = now()
-                    obs, _reward, action_done, info = step_env(
-                        env,
-                        action,
-                        sleep_after_execution=args.sleep_after_execution,
-                    )
-                    action_end = now()
-                    tool_name = tool_name_from_action(action)
-                    write_jsonl(
-                        trace_path,
-                        trace_event(
-                            task_id=task_id,
-                            benchmark=args.benchmark,
-                            framework=args.framework,
-                            model=args.model,
-                            step_id=step_id,
-                            event_type="tool_call",
-                            start=action_start,
-                            end=action_end,
-                            program_id=program_id,
-                            tool_name=tool_name,
-                            tool_args_size=len(action.encode("utf-8")),
-                            success=True,
-                            state_delta={"action": action, "info": info},
-                        ),
-                    )
-                    obs_sizes = observation_size(obs)
-                    write_jsonl(
-                        trace_path,
-                        trace_event(
-                            task_id=task_id,
-                            benchmark=args.benchmark,
-                            framework=args.framework,
-                            model=args.model,
-                            step_id=step_id,
-                            event_type="env_observation",
-                            start=action_end,
-                            end=now(),
-                            program_id=program_id,
-                            observation_size_bytes=obs_sizes["total"],
-                            success=True,
-                            state_delta={"obs_sizes": obs_sizes, "done": action_done},
-                        ),
-                    )
-                    if action_done or action in {"DONE", "FAIL"}:
-                        done = True
-                        break
-
-                step_count = step_id
-                if done:
-                    break
-
-            if args.settle_sleep > 0:
-                time.sleep(args.settle_sleep)
-            score = evaluate_env(env)
-        except Exception as exc:
-            error = f"{type(exc).__name__}: {exc}"
-            write_jsonl(
-                trace_path,
-                trace_event(
-                    task_id=task_id,
-                    benchmark=args.benchmark,
-                    framework=args.framework,
-                    model=args.model,
-                    step_id=step_count,
-                    event_type="env_observation",
-                    start=now(),
-                    end=now(),
-                    program_id=program_id,
-                    success=False,
-                    error_type=type(exc).__name__,
-                    state_delta={
-                        "error": str(exc),
-                        "traceback": traceback.format_exc(),
-                    },
-                ),
-            )
-        finally:
-            if not args.no_recording:
-                maybe_end_recording(env, recording_path)
-
-    result = EpisodeResult(
-        task_id=task_id,
-        domain=task.domain,
-        example_id=task.example_id,
-        program_id=program_id,
-        score=float(score),
-        success=score > 0,
-        steps=step_count,
-        output_dir=str(task_output_dir),
-        trace_path=str(trace_path),
-        error=error,
-    )
-    with result_path.open("w", encoding="utf-8") as handle:
-        json.dump(result.__dict__, handle, indent=2)
-    return result
-
-
-def run_batch(args: argparse.Namespace, tasks: list[TaskSpec]) -> list[EpisodeResult]:
-    results: list[EpisodeResult] = []
-    env = None
-    try:
-        env = create_desktop_env(args)
-        for task in tasks:
-            results.append(run_one_task(env=env, args=args, task=task))
-    except Exception as exc:
-        for task in tasks:
-            task_output_dir = Path(args.output_dir) / task.domain / task.example_id
-            task_output_dir.mkdir(parents=True, exist_ok=True)
-            result = EpisodeResult(
-                task_id=task.instance_id,
-                domain=task.domain,
-                example_id=task.example_id,
-                program_id="",
-                score=0.0,
-                success=False,
-                steps=0,
-                output_dir=str(task_output_dir),
-                trace_path="",
-                error=f"{type(exc).__name__}: {exc}",
-            )
-            with (task_output_dir / "result.json").open("w", encoding="utf-8") as handle:
-                json.dump(result.__dict__, handle, indent=2)
-            results.append(result)
-    finally:
-        if env is not None:
-            try:
-                env.close()
-            except Exception:
-                pass
-    return results
-
-
-def load_test_meta(path: Path) -> dict[str, list[str]]:
-    with path.open(encoding="utf-8") as handle:
+def load_meta(path: str) -> dict[str, list[str]]:
+    with Path(path).open(encoding="utf-8") as handle:
         payload = json.load(handle)
-    return {
-        str(domain): [str(example_id) for example_id in examples]
-        for domain, examples in payload.items()
-    }
+    return {str(domain): [str(example_id) for example_id in examples] for domain, examples in payload.items()}
 
 
-def resolve_task_ids(args: argparse.Namespace) -> list[TaskSpec]:
-    meta_path = Path(args.test_all_meta_path)
-    meta: dict[str, list[str]] | None = None
+def select_tasks(args: argparse.Namespace) -> dict[str, list[str]]:
+    meta = load_meta(args.test_all_meta_path)
+    selected: list[tuple[str, str]] = []
 
     if args.task_ids:
         raw_ids = [item.strip() for item in args.task_ids.split(",") if item.strip()]
-        tasks: list[TaskSpec] = []
         for raw_id in raw_ids:
             if "/" in raw_id:
                 domain, example_id = raw_id.split("/", 1)
-                tasks.append(TaskSpec(domain=domain, example_id=example_id))
-                continue
-            if args.domain != "all":
-                tasks.append(TaskSpec(domain=args.domain, example_id=raw_id))
-                continue
-            if meta is None:
-                meta = load_test_meta(meta_path)
-            matches = [
-                TaskSpec(domain=domain, example_id=raw_id)
-                for domain, examples in meta.items()
-                if raw_id in examples
-            ]
-            if len(matches) != 1:
-                raise ValueError(
-                    f"Task id {raw_id!r} is ambiguous or missing; use domain/example_id."
-                )
-            tasks.extend(matches)
-        return tasks
+            elif args.domain != "all":
+                domain, example_id = args.domain, raw_id
+            else:
+                matches = [
+                    (domain_name, raw_id)
+                    for domain_name, examples in meta.items()
+                    if raw_id in examples
+                ]
+                if len(matches) != 1:
+                    raise ValueError(
+                        f"Task id {raw_id!r} is ambiguous or missing; use domain/example_id."
+                    )
+                domain, example_id = matches[0]
+            if domain not in meta or example_id not in meta[domain]:
+                raise ValueError(f"Unknown OSWorld task: {domain}/{example_id}")
+            selected.append((domain, example_id))
+    else:
+        for domain, examples in meta.items():
+            if args.domain == "all" or args.domain == domain:
+                selected.extend((domain, example_id) for example_id in examples)
+        if args.task_start:
+            selected = selected[args.task_start :]
+        if args.num_tasks:
+            selected = selected[: args.num_tasks]
 
-    meta = load_test_meta(meta_path)
-    tasks = [
-        TaskSpec(domain=domain, example_id=example_id)
-        for domain, examples in meta.items()
-        if args.domain == "all" or args.domain == domain
-        for example_id in examples
-    ]
-    if args.task_start:
-        tasks = tasks[args.task_start :]
-    if args.num_tasks:
-        tasks = tasks[: args.num_tasks]
-    return tasks
+    if not selected:
+        raise ValueError("No OSWorld tasks selected.")
 
-
-def partition_tasks(tasks: list[TaskSpec], max_concurrency: int) -> list[list[TaskSpec]]:
-    batches = [[] for _ in range(max_concurrency)]
-    for index, task in enumerate(tasks):
-        batches[index % max_concurrency].append(task)
-    return [batch for batch in batches if batch]
+    output: dict[str, list[str]] = {}
+    for domain, example_id in selected:
+        output.setdefault(domain, []).append(example_id)
+    return output
 
 
-def write_run_summary(output_dir: Path, results: list[EpisodeResult]) -> None:
-    scores = [result.score for result in results]
-    summary = {
-        "num_tasks": len(results),
-        "num_errors": sum(1 for result in results if result.error),
-        "success_rate": mean(scores) if scores else 0.0,
-        "mean_steps": mean([result.steps for result in results]) if results else 0.0,
-        "agent_s_version": PINNED_AGENT_S_VERSION,
-    }
-    with (output_dir / "summary.json").open("w", encoding="utf-8") as handle:
-        json.dump(summary, handle, indent=2)
+def write_selected_meta(result_dir: str, selected_meta: dict[str, list[str]]) -> str:
+    path = Path(result_dir) / "_selected_test_meta.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(selected_meta, handle, indent=2)
+    return str(path)
 
 
-def warn_runtime_tools() -> None:
-    if shutil.which("tesseract") is None:
-        print(
-            "WARNING: tesseract was not found on PATH. Agent-S OCR/text-grounding "
-            "actions may fail until the system package is installed.",
-            file=sys.stderr,
+def should_rewrite_hf_urls() -> bool:
+    return os.environ.get("OSWORLD_REWRITE_HF_URLS", "1") != "0"
+
+
+def hf_endpoint() -> str:
+    return os.environ.get("HF_ENDPOINT", DEFAULT_HF_ENDPOINT).strip().rstrip("/")
+
+
+def rewrite_hf_url(value: str) -> str:
+    endpoint = hf_endpoint()
+    if not endpoint or "huggingface.co" not in value:
+        return value
+
+    parsed = urlsplit(value)
+    if parsed.netloc not in {"huggingface.co", "www.huggingface.co"}:
+        return value
+
+    endpoint_parts = urlsplit(endpoint)
+    if not endpoint_parts.scheme or not endpoint_parts.netloc:
+        return value
+
+    return urlunsplit(
+        (
+            endpoint_parts.scheme,
+            endpoint_parts.netloc,
+            parsed.path,
+            parsed.query,
+            parsed.fragment,
         )
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--osworld-root", default=os.environ.get("OSWORLD_SOURCE_ROOT", ""))
-    parser.add_argument("--test-config-base-dir", default="evaluation_examples")
-    parser.add_argument("--test-all-meta-path", default="evaluation_examples/test_nogdrive.json")
-    parser.add_argument("--domain", default="all")
-    parser.add_argument("--task-ids", default="")
-    parser.add_argument("--task-start", type=int, default=0)
-    parser.add_argument("--num-tasks", type=int, default=1, help="0 means all selected tasks")
-    parser.add_argument("--benchmark", default=DEFAULT_BENCHMARK)
-    parser.add_argument("--framework", default="")
-    parser.add_argument("--scaffold", default="")
-    parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--max-concurrency", type=int, default=1)
-    parser.add_argument(
-        "--agent-kind",
-        choices=["agent-s", "opencua"],
-        default=DEFAULT_AGENT_KIND,
     )
 
-    parser.add_argument("--provider-name", default="aws", choices=["aws", "virtualbox", "vmware", "docker", "azure"])
-    parser.add_argument("--path-to-vm", default="")
-    parser.add_argument("--snapshot-name", default="")
-    parser.add_argument("--region", default="us-east-1")
-    parser.add_argument("--headless", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--screen-width", type=int, default=1920)
-    parser.add_argument("--screen-height", type=int, default=1080)
-    parser.add_argument("--os-type", default="Ubuntu")
-    parser.add_argument("--client-password", default="")
-    parser.add_argument("--password", default="osworld-public-evaluation")
-    parser.add_argument("--enable-proxy", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--no-recording", action="store_true")
 
-    parser.add_argument("--action-space", default="pyautogui")
-    parser.add_argument(
-        "--observation-type",
-        choices=["screenshot", "a11y_tree", "screenshot_a11y_tree", "som"],
-        default="screenshot",
-    )
-    parser.add_argument("--sleep-after-execution", type=float, default=5.0)
-    parser.add_argument("--reset-sleep", type=float, default=60.0)
-    parser.add_argument("--settle-sleep", type=float, default=20.0)
-    parser.add_argument("--max-steps", type=int, default=100)
-
-    parser.add_argument("--model", required=True)
-    parser.add_argument("--base-url", default="http://127.0.0.1:9000/v1")
-    parser.add_argument("--api-key", default="EMPTY")
-    parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--top-p", type=float, default=0.9)
-    parser.add_argument("--max-output-tokens", type=int, default=1000)
-    parser.add_argument("--extra-body", default="")
-
-    parser.add_argument("--agent-s-engine-type", default="openai")
-    parser.add_argument("--agent-s-main-engine-type", default="")
-    parser.add_argument("--agent-s-main-model", default="")
-    parser.add_argument("--agent-s-main-base-url", default="")
-    parser.add_argument("--agent-s-main-api-key", default="")
-    parser.add_argument("--agent-s-main-extra-body", default="")
-    parser.add_argument("--agent-s-grounding-engine-type", default="")
-    parser.add_argument("--agent-s-grounding-model", default="")
-    parser.add_argument("--agent-s-grounding-base-url", default="")
-    parser.add_argument("--agent-s-grounding-api-key", default="")
-    parser.add_argument("--agent-s-grounding-extra-body", default="")
-    parser.add_argument("--agent-s-grounding-width", type=int, default=1920)
-    parser.add_argument("--agent-s-grounding-height", type=int, default=1080)
-    parser.add_argument("--agent-s-code-engine-type", default="")
-    parser.add_argument("--agent-s-code-model", default="")
-    parser.add_argument("--agent-s-code-base-url", default="")
-    parser.add_argument("--agent-s-code-api-key", default="")
-    parser.add_argument("--agent-s-code-extra-body", default="")
-    parser.add_argument("--agent-s-code-agent-budget", type=int, default=20)
-    parser.add_argument("--agent-s-enable-code-agent", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--agent-s-max-trajectory-length", type=int, default=8)
-    parser.add_argument("--agent-s-enable-reflection", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--agent-s-strict-version", action=argparse.BooleanOptionalAction, default=True)
-
-    parser.add_argument("--opencua-model", default="")
-    parser.add_argument("--opencua-base-url", default="")
-    parser.add_argument("--opencua-api-key", default="")
-    parser.add_argument("--opencua-extra-body", default="")
-    parser.add_argument("--opencua-max-tokens", type=int, default=0)
-    parser.add_argument(
-        "--opencua-history-type",
-        choices=["action_history", "thought_history", "observation_history"],
-        default="action_history",
-    )
-    parser.add_argument(
-        "--opencua-coordinate-type",
-        choices=["relative", "qwen25"],
-        default="qwen25",
-    )
-    parser.add_argument("--opencua-cot-level", choices=["l1", "l2", "l3"], default="l2")
-    parser.add_argument("--opencua-max-image-history-length", type=int, default=3)
-    parser.add_argument(
-        "--opencua-use-old-sys-prompt",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Recommended for OpenCUA-7B and OpenCUA-32B; disable for OpenCUA-72B.",
-    )
-    parser.add_argument("--opencua-request-timeout", type=float, default=500.0)
-    parser.add_argument("--opencua-max-retries", type=int, default=20)
-    return parser.parse_args()
+def rewrite_hf_urls(value: Any) -> Any:
+    if isinstance(value, str):
+        return rewrite_hf_url(value)
+    if isinstance(value, list):
+        return [rewrite_hf_urls(item) for item in value]
+    if isinstance(value, dict):
+        return {key: rewrite_hf_urls(item) for key, item in value.items()}
+    return value
 
 
-def configure_agent_defaults(args: argparse.Namespace) -> None:
-    if not args.framework:
-        args.framework = DEFAULT_AGENT_FRAMEWORKS[args.agent_kind]
-    if not args.scaffold:
-        args.scaffold = DEFAULT_AGENT_SCAFFOLDS[args.agent_kind]
-    if not args.opencua_model:
-        args.opencua_model = args.model
-    if not args.opencua_base_url:
-        args.opencua_base_url = args.base_url
-    if not args.opencua_api_key:
-        args.opencua_api_key = args.api_key
+def install_hf_url_rewrite_patch() -> None:
+    if not should_rewrite_hf_urls():
+        return
+
+    import requests
+
+    session_cls = requests.sessions.Session
+    if getattr(session_cls, "_thunderagent_hf_rewrite_patched", False):
+        return
+
+    original_request = session_cls.request
+
+    def patched_request(self: Any, method: str, url: Any, *args: Any, **kwargs: Any) -> Any:
+        if isinstance(url, str):
+            url = rewrite_hf_url(url)
+        return original_request(self, method, url, *args, **kwargs)
+
+    session_cls.request = patched_request
+    session_cls._thunderagent_hf_rewrite_patched = True
+
+
+def ensure_import_paths(osworld_root: str) -> None:
+    for path in (str(REPO_ROOT), osworld_root):
+        if path not in sys.path:
+            sys.path.insert(0, path)
+
+
+def install_thunderagent_patches(
+    args: argparse.Namespace,
+    *,
+    id_to_domain: dict[str, str],
+) -> None:
+    import lib_run_single
+    from examples.adapters.osworld import osworld_instance
+    from ThunderAgent.adapters import inject_program_id
+    from mm_agents import qwen3vl_agent as qwen3vl_module
+
+    parsed_extra_body = safe_json_object(args.extra_body, option_name="--extra-body")
+    qwen3vl_module.MAX_RETRY_TIMES = args.max_retries
+
+    if not getattr(qwen3vl_module.Qwen3VLAgent, "_thunderagent_init_patched", False):
+        original_init = qwen3vl_module.Qwen3VLAgent.__init__
+
+        def patched_init(self, *init_args: Any, **kwargs: Any) -> None:
+            kwargs.setdefault("api_backend", "openai")
+            kwargs.setdefault("history_n", args.history_n)
+            kwargs.setdefault("enable_thinking", args.enable_thinking)
+            kwargs.setdefault("thinking_budget", args.thinking_budget)
+            original_init(self, *init_args, **kwargs)
+
+        qwen3vl_module.Qwen3VLAgent.__init__ = patched_init
+        qwen3vl_module.Qwen3VLAgent._thunderagent_init_patched = True
+
+    if not getattr(qwen3vl_module.Qwen3VLAgent, "_thunderagent_reset_patched", False):
+        original_reset = qwen3vl_module.Qwen3VLAgent.reset
+
+        def patched_reset(self: Any, *reset_args: Any, **reset_kwargs: Any) -> Any:
+            reset_kwargs.pop("vm_ip", None)
+            return original_reset(self, *reset_args, **reset_kwargs)
+
+        qwen3vl_module.Qwen3VLAgent.reset = patched_reset
+        qwen3vl_module.Qwen3VLAgent._thunderagent_reset_patched = True
+
+    def patched_call_llm_openai(self, messages: list[dict[str, Any]], model: str) -> str:
+        import openai
+
+        client = openai.OpenAI(base_url=args.base_url, api_key=args.api_key)
+        logger = qwen3vl_module.logger
+        last_error: Exception | None = None
+        for attempt in range(1, args.max_retries + 1):
+            if logger is not None:
+                logger.info(
+                    "[OpenAI/ThunderAgent] Generating content with model: %s "
+                    "(attempt %s/%s)",
+                    model,
+                    attempt,
+                    args.max_retries,
+                )
+            try:
+                extra_body = dict(parsed_extra_body)
+                chat_template_kwargs = extra_body.get("chat_template_kwargs") or {}
+                if not isinstance(chat_template_kwargs, dict):
+                    chat_template_kwargs = {}
+                chat_template_kwargs["enable_thinking"] = bool(args.enable_thinking)
+                extra_body["chat_template_kwargs"] = chat_template_kwargs
+                if args.enable_thinking:
+                    extra_body.setdefault("thinking_token_budget", args.thinking_budget)
+                extra_body = inject_program_id(extra_body)
+                request_messages = messages
+                request_kwargs: dict[str, Any] = {}
+                if args.use_vllm_tool_calls:
+                    request_messages = prepare_messages_for_native_tool_calls(
+                        messages, args.coordinate_type
+                    )
+                    request_kwargs.update(
+                        {
+                            "tools": [COMPUTER_USE_TOOL],
+                            "tool_choice": native_tool_choice(args.tool_choice),
+                            "parallel_tool_calls": False,
+                        }
+                    )
+
+                completion = client.chat.completions.create(
+                    model=model,
+                    messages=request_messages,
+                    max_tokens=self.max_tokens,
+                    temperature=self.temperature,
+                    top_p=self.top_p,
+                    extra_body=extra_body,
+                    timeout=args.request_timeout,
+                    **request_kwargs,
+                )
+                message = completion.choices[0].message
+                content = content_to_text(getattr(message, "content", None))
+                if args.use_vllm_tool_calls:
+                    native_response = tool_calls_to_legacy_response(
+                        getattr(message, "tool_calls", None), content
+                    )
+                    if native_response:
+                        if logger is not None:
+                            logger.info(
+                                "[OpenAI/ThunderAgent] Parsed native tool_calls from vLLM"
+                            )
+                        return native_response
+                    xml_response = qwen_xml_content_to_legacy_response(content)
+                    if xml_response:
+                        if logger is not None:
+                            logger.info(
+                                "[OpenAI/ThunderAgent] Parsed qwen XML tool call content"
+                            )
+                        return xml_response
+                    if logger is not None:
+                        logger.warning(
+                            "[OpenAI/ThunderAgent] No native tool_calls returned; falling back to content parser"
+                        )
+                return content
+            except Exception as exc:  # match OSWorld's forgiving retry behavior
+                last_error = exc
+                if logger is not None:
+                    logger.error("[OpenAI/ThunderAgent] Error calling model: %s", exc)
+                if attempt < args.max_retries:
+                    time.sleep(min(5.0 * attempt, 30.0))
+        if logger is not None and last_error is not None:
+            logger.error("[OpenAI/ThunderAgent] Exhausted retries: %s", last_error)
+        return ""
+
+    qwen3vl_module.Qwen3VLAgent._call_llm_openai = patched_call_llm_openai
+
+    if not getattr(lib_run_single, "_thunderagent_run_single_patched", False):
+        original_run_single_example = lib_run_single.run_single_example
+
+        def patched_run_single_example(
+            agent: Any,
+            env: Any,
+            example: dict[str, Any],
+            max_steps: int,
+            instruction: str,
+            run_args: argparse.Namespace,
+            example_result_dir: str,
+            scores: Any,
+        ) -> Any:
+            example_id = str(example.get("id") or Path(example_result_dir).name)
+            domain = id_to_domain.get(example_id) or Path(example_result_dir).parent.name
+            patched_example = rewrite_hf_urls(example) if should_rewrite_hf_urls() else example
+            instance_id = f"{domain}/{example_id}"
+            with osworld_instance(
+                {},
+                instance_id=instance_id,
+                base_url=args.base_url,
+                scaffold=args.scaffold,
+            ):
+                return original_run_single_example(
+                    agent,
+                    env,
+                    patched_example,
+                    max_steps,
+                    instruction,
+                    run_args,
+                    example_result_dir,
+                    scores,
+                )
+
+        lib_run_single.run_single_example = patched_run_single_example
+        lib_run_single._thunderagent_run_single_patched = True
+
+
+def build_native_argv(args: argparse.Namespace, selected_meta_path: str) -> list[str]:
+    argv = [
+        native_runner_path(args),
+        "--action_space",
+        args.action_space,
+        "--observation_type",
+        args.observation_type,
+        "--sleep_after_execution",
+        str(args.sleep_after_execution),
+        "--max_steps",
+        str(args.max_steps),
+        "--test_config_base_dir",
+        args.test_config_base_dir,
+        "--model",
+        args.model,
+        "--temperature",
+        str(args.temperature),
+        "--top_p",
+        str(args.top_p),
+        "--max_tokens",
+        str(args.max_tokens),
+        "--coord",
+        args.coordinate_type,
+        "--domain",
+        "all",
+        "--test_all_meta_path",
+        selected_meta_path,
+        "--result_dir",
+        args.result_dir,
+        "--num_envs",
+        str(args.num_envs),
+        "--log_level",
+        args.log_level,
+        "--region",
+        args.region,
+        "--provider_name",
+        args.provider_name,
+        "--client_password",
+        args.client_password,
+        "--screen_width",
+        str(args.screen_width),
+        "--screen_height",
+        str(args.screen_height),
+    ]
+    if args.path_to_vm:
+        argv.extend(["--path_to_vm", args.path_to_vm])
+    if args.headless:
+        argv.append("--headless")
+    if args.add_thought_prefix:
+        argv.append("--add_thought_prefix")
+    return argv
+
+
+def native_runner_path(args: argparse.Namespace) -> str:
+    if args.native_runner:
+        return str(Path(args.native_runner).expanduser().resolve())
+    return str(Path(args.osworld_root) / "scripts" / "python" / "run_multienv_qwen3vl.py")
 
 
 def main() -> int:
-    args = parse_args()
-    configure_agent_defaults(args)
-    if args.max_concurrency < 1:
-        raise ValueError("--max-concurrency must be >= 1")
-    if args.task_start < 0:
-        raise ValueError("--task-start must be >= 0")
-    if args.num_tasks < 0:
-        raise ValueError("--num-tasks must be >= 0")
-    if args.agent_kind == "agent-s":
-        if args.agent_s_max_trajectory_length < 1:
-            raise ValueError("--agent-s-max-trajectory-length must be >= 1")
-        if args.agent_s_grounding_width < 1 or args.agent_s_grounding_height < 1:
-            raise ValueError("--agent-s-grounding-width/height must be positive")
-    if args.agent_kind == "opencua":
-        if args.action_space != "pyautogui":
-            raise ValueError("OpenCUA currently supports only --action-space pyautogui")
-        if args.observation_type != "screenshot":
-            raise ValueError("OpenCUA currently supports only --observation-type screenshot")
-        if args.opencua_max_image_history_length < 1:
-            raise ValueError("--opencua-max-image-history-length must be >= 1")
-        if args.opencua_max_retries < 1:
-            raise ValueError("--opencua-max-retries must be >= 1")
+    args = configure_args(parse_args())
+    osworld_root = Path(args.osworld_root)
+    native_runner = Path(native_runner_path(args))
+    if not osworld_root.exists():
+        raise FileNotFoundError(f"OSWorld root not found: {osworld_root}")
+    if not native_runner.exists():
+        raise FileNotFoundError(f"OSWorld Qwen3VL runner not found: {native_runner}")
+    if not Path(args.test_all_meta_path).exists():
+        raise FileNotFoundError(f"OSWorld test meta not found: {args.test_all_meta_path}")
 
-    ensure_osworld_on_path(args.osworld_root)
-    maybe_load_dotenv(args.osworld_root)
-    if args.agent_kind == "agent-s":
-        validate_agent_s_version(args.agent_s_strict_version)
-    warn_runtime_tools()
+    selected_meta = select_tasks(args)
+    selected_meta_path = write_selected_meta(args.result_dir, selected_meta)
+    id_to_domain = {
+        example_id: domain
+        for domain, example_ids in selected_meta.items()
+        for example_id in example_ids
+    }
 
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    tasks = resolve_task_ids(args)
-    if not tasks:
-        raise ValueError("No OSWorld tasks selected.")
+    ensure_import_paths(str(osworld_root))
+    os.environ["OPENAI_BASE_URL"] = args.base_url
+    os.environ["OPENAI_API_KEY"] = args.api_key
+    os.environ["OSWORLD_SOURCE_ROOT"] = str(osworld_root)
+    os.environ.setdefault("HF_ENDPOINT", DEFAULT_HF_ENDPOINT)
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
-    batches = partition_tasks(tasks, min(args.max_concurrency, len(tasks)))
-    results_by_task: dict[str, EpisodeResult] = {}
+    install_hf_url_rewrite_patch()
+    install_thunderagent_patches(args, id_to_domain=id_to_domain)
 
-    if len(batches) == 1:
-        for result in run_batch(args, batches[0]):
-            results_by_task[result.task_id] = result
-    else:
-        with ProcessPoolExecutor(max_workers=len(batches)) as executor:
-            futures = {executor.submit(run_batch, args, batch): batch for batch in batches}
-            for future in as_completed(futures):
-                batch = futures[future]
-                try:
-                    results = future.result()
-                except Exception as exc:
-                    results = [
-                        EpisodeResult(
-                            task_id=task.instance_id,
-                            domain=task.domain,
-                            example_id=task.example_id,
-                            program_id="",
-                            score=0.0,
-                            success=False,
-                            steps=0,
-                            output_dir=str(output_dir / task.domain / task.example_id),
-                            trace_path="",
-                            error=f"{type(exc).__name__}: {exc}",
-                        )
-                        for task in batch
-                    ]
-                for result in results:
-                    results_by_task[result.task_id] = result
-
-    ordered_results = [results_by_task[task.instance_id] for task in tasks]
-    with (output_dir / "results.json").open("w", encoding="utf-8") as handle:
-        json.dump([result.__dict__ for result in ordered_results], handle, indent=2)
-    write_run_summary(output_dir, ordered_results)
-    print(json.dumps([result.__dict__ for result in ordered_results], indent=2))
-    return 0 if all(result.error is None for result in ordered_results) else 1
+    old_argv = sys.argv[:]
+    old_cwd = os.getcwd()
+    try:
+        (osworld_root / "logs").mkdir(exist_ok=True)
+        os.chdir(osworld_root)
+        sys.argv = build_native_argv(args, selected_meta_path)
+        runpy.run_path(str(native_runner), run_name="__main__")
+    finally:
+        sys.argv = old_argv
+        os.chdir(old_cwd)
+    return 0
 
 
 if __name__ == "__main__":

@@ -47,14 +47,14 @@ SWEBENCH_LIMIT=1 SWEBENCH_WORKERS=1 \
 bash examples/benchmark/swebench/run_openhands_ta_default.sh
 
 OSWORLD_SOURCE_ROOT=/raid0/liyi/OSWorld OSWORLD_NUM_TASKS=1 \
-bash examples/benchmark/osworld_verified/run_osworld_verified_default.sh
+bash examples/benchmark/osworld_verified/router_default.sh
 ```
 
 You can always point a runner at a custom env:
 
 ```bash
 PYTHON_BIN=/path/to/env/bin/python \
-bash examples/benchmark/osworld_verified/run_osworld_verified_default.sh
+bash examples/benchmark/osworld_verified/router_default.sh
 ```
 
 ## Dependency Manifests
@@ -62,7 +62,7 @@ bash examples/benchmark/osworld_verified/run_osworld_verified_default.sh
 | Scaffold | Dependency manifest |
 | --- | --- |
 | OpenHands | `examples/scaffold/openhands/pyproject.toml` + `uv.lock` |
-| OSWorld-Verified | `examples/scaffold/osworld/requirements.txt` with `gui-agents==0.3.2` + `${OSWORLD_SOURCE_ROOT}/requirements.txt` |
+| OSWorld-Verified | `examples/scaffold/osworld/requirements.txt` + `${OSWORLD_SOURCE_ROOT}/requirements.txt` |
 
 Keep benchmark-specific dependencies in those scaffold directories rather than
 adding them to the root ThunderAgent `pyproject.toml`.

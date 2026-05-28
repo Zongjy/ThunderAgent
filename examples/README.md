@@ -13,7 +13,7 @@ Agent frameworks that can be pointed at ThunderAgent:
 | Agent | Directory | Description |
 |-------|-----------|-------------|
 | OpenHands | [`scaffold/openhands`](scaffold/openhands) | Software development agent scaffold used by SWE-bench runs |
-| OSWorld + Agent-S | [`scaffold/osworld`](scaffold/osworld) | OSWorld desktop scaffold using pinned Agent-S as the GUI agent loop |
+| OSWorld + Qwen3.5 | [`scaffold/osworld`](scaffold/osworld) | Thin wrapper around OSWorld's native Qwen3VL multi-env GUI runner |
 
 ## Adapters
 
@@ -31,4 +31,4 @@ Benchmark-specific runners and analysis code:
 | Benchmark | Directory | Description |
 |-----------|-----------|-------------|
 | SWE-bench | [`benchmark/swebench`](benchmark/swebench) | OpenHands + ThunderAgent runner and tool-call/profile analysis utilities |
-| OSWorld-Verified | [`benchmark/osworld_verified`](benchmark/osworld_verified) | OSWorld + Agent-S runner and computer-use action/observation analysis |
+| OSWorld-Verified | [`benchmark/osworld_verified`](benchmark/osworld_verified) | OSWorld native Qwen3VL runner through Qwen3.5 and ThunderAgent |

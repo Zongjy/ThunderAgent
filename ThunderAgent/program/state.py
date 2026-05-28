@@ -40,6 +40,8 @@ class Program:
     state: ProgramState = ProgramState.ACTIVE  # Lifecycle state (active/paused/terminated)
     context_len: int = 0
     total_tokens: int = 0
+    last_estimated_tokens: int = 0
+    last_request_has_multimodal: bool = False
     step_count: int = 0
     profile: Optional["ProfileState"] = None  # Profile timing data (when profiling enabled)
     waiting_event: Optional[asyncio.Event] = field(default=None, repr=False)  # Event to wait on when paused

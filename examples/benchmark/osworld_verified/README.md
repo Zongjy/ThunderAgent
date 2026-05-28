@@ -1,81 +1,84 @@
 # OSWorld-Verified Benchmark
 
-This benchmark runner starts vLLM, ThunderAgent, and the OSWorld Agent-S
-scaffold. OSWorld still provides `DesktopEnv`, reset/evaluation logic, and
-task metadata; Agent-S is now the only GUI agent loop.
+This benchmark runner is split into a long-lived vLLM launcher and a separate
+ThunderAgent + OSWorld launcher. The model served by default is Qwen3.5-27B,
+while the GUI-control scaffold remains OSWorld's Qwen3VL-style computer-use
+agent.
 
 Clone OSWorld first and point `OSWORLD_SOURCE_ROOT` at it:
 
 ```bash
-git clone https://github.com/xlang-ai/OSWorld.git /raid0/liyi/OSWorld
-OSWORLD_SOURCE_ROOT=/raid0/liyi/OSWorld \
+git clone https://github.com/xlang-ai/OSWorld.git ~/OSWorld
+OSWORLD_SOURCE_ROOT=~/OSWorld \
 bash examples/scripts/setup_benchmark_env.sh osworld
 ```
 
-Run a one-task smoke test:
+Start vLLM first:
 
 ```bash
-OSWORLD_SOURCE_ROOT=/raid0/liyi/OSWorld \
+bash examples/benchmark/osworld_verified/vllm_serve_qwen35_27b.sh
+```
+
+Then run a one-task smoke test through the default router:
+
+```bash
+OSWORLD_SOURCE_ROOT=~/OSWorld \
 OSWORLD_NUM_TASKS=1 \
 OSWORLD_MAX_STEPS=100 \
-bash examples/benchmark/osworld_verified/run_osworld_verified_default.sh
+bash examples/benchmark/osworld_verified/router_default.sh
+```
+
+Use the capacity-scheduling router with:
+
+```bash
+bash examples/benchmark/osworld_verified/router_tr.sh
 ```
 
 Important defaults:
 
-- `MODEL=ByteDance-Seed/UI-TARS-1.5-7B`
+- `MODEL=Qwen/Qwen3.5-27B`
+- `SERVED_MODEL_NAME=qwen3.5-27B`
 - `AGENT_LLM=${SERVED_MODEL_NAME}`
-- `VLLM_EXTRA_ARGS=--trust-remote-code`
-- `MAX_MODEL_LEN=32768`
-- `REASONING_PARSER=` unset
-- `OSWORLD_TEMPERATURE=0`
-- `OSWORLD_TOP_P=0.9`
-- `OSWORLD_MAX_OUTPUT_TOKENS=1000`
+- `VLLM_BASE_URL=http://127.0.0.1:${VLLM_PORT}`
+- `QWEN3VL_BASE_URL=http://127.0.0.1:${TA_PORT}/v1`
+- `QWEN3VL_MODEL=${AGENT_LLM}`
+- `QWEN3VL_COORDINATE_TYPE=relative`
+- `QWEN3VL_HISTORY_N=4`
+- `QWEN3VL_ENABLE_THINKING=0`
+- `QWEN3VL_USE_VLLM_TOOL_CALLS=1`
+- `QWEN3VL_TOOL_CHOICE=named`
+- `OSWORLD_MAX_OUTPUT_TOKENS=32768`
+- `MAX_NUM_SEQS=32`
 - `OSWORLD_MAX_STEPS=100`
 - `OSWORLD_OBSERVATION_TYPE=screenshot`
 - `OSWORLD_ACTION_SPACE=pyautogui`
-- `AGENT_S_VERSION=0.3.2`
-- `AGENT_S_ENGINE_TYPE=openai`
-- `AGENT_S_BASE_URL=http://127.0.0.1:${TA_PORT}/v1`
-- `AGENT_S_MAIN_MODEL=${AGENT_LLM}`
-- `AGENT_S_GROUNDING_MODEL=${AGENT_LLM}`
-- `AGENT_S_ENABLE_CODE_AGENT=0`
-- `AGENT_S_MAX_TRAJECTORY_LENGTH=8`
-- `AGENT_S_ENABLE_REFLECTION=1`
-- `AGENT_S_STRICT_VERSION=1`
-- `ENABLE_VLLM_LANGUAGE_MODEL_ONLY=0`
-- `ENABLE_VLLM_TOOL_CALLING=0`
+- `ENABLE_VLLM_TOOL_CALLING=1`
+- `TOOL_CALL_PARSER=qwen3_coder`
+- `VLLM_ENFORCE_STRICT_TOOL_CALLING=1`
+- `THUNDERAGENT_KV_CAPACITY_TOKENS=380000`
 
 Set `OSWORLD_TASK_IDS=domain/example_id` to run exact examples. Set
 `OSWORLD_DOMAIN=<domain>` with `OSWORLD_TASK_START` and `OSWORLD_NUM_TASKS` to
 select a slice from OSWorld's `test_nogdrive.json`.
 
-## Agent-S Pin
+## Native Runner
 
-The setup helper installs `examples/scaffold/osworld/requirements.txt`, which
-pins `gui-agents==0.3.2`. The launcher checks this before starting services
-when `AGENT_S_STRICT_VERSION=1`, and the Python runner repeats the same check
-inside worker processes.
+The ThunderAgent wrapper delegates the actual experiment loop to OSWorld:
 
-Install `tesseract-ocr` on the host if Agent-S text grounding/OCR is used.
-Without it, the runner will warn and Agent-S OCR actions may fail.
+```text
+Manager.Queue of tasks
+N multiprocessing.Process workers
+each worker creates one DesktopEnv and one Qwen3VLAgent
+lib_run_single.run_single_example(...)
+env.reset -> agent.predict -> env.step -> env.evaluate
+```
 
-## Parallel Experiments
+The runtime patch is on the model call: OSWorld's Qwen3VL agent uses the
+OpenAI-compatible ThunderAgent endpoint, the wrapper sends the `computer_use`
+tool schema to vLLM, reads `message.tool_calls`, and converts those calls back
+to OSWorld pyautogui actions. It also attaches `extra_body.program_id` per task
+so ThunderAgent can profile and schedule each desktop episode independently.
 
-Set `OSWORLD_MAX_CONCURRENCY=N` to run up to `N` OSWorld tasks in parallel.
-Each worker process owns a separate `DesktopEnv` and a separate ThunderAgent
-`program_id`, while all workers share the same ThunderAgent and vLLM services.
-
-Expected constraints:
-
-- Local VirtualBox/VMware/Docker providers usually need one independent VM or
-  container per worker; otherwise runs can collide on the same desktop state.
-- AWS parallel runs need enough instance quota and cleanup discipline in the
-  selected region.
-- vLLM GPU memory and throughput can become the bottleneck because Agent-S may
-  make multiple LLM calls per OSWorld step.
-- ThunderAgent can schedule multiple programs, but all requests must preserve
-  `extra_body.program_id`; this runner patches Agent-S engines to do that.
-
-Start with `OSWORLD_MAX_CONCURRENCY=1` for smoke tests, then raise it after the
-provider and model server are stable.
+Native OSWorld results are written under
+`<run>/osworld_outputs/summary/results.json`, with task artifacts under
+`<run>/osworld_outputs/<action_space>/<observation_type>/<model>/<domain>/<id>/`.

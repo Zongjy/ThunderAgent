@@ -9,7 +9,7 @@ Agent frameworks that can be routed through ThunderAgent:
 | Agent | Directory | Description |
 |-------|-----------|-------------|
 | **OpenHands** | [`scaffold/openhands`](../examples/scaffold/openhands) | General software development and science discovery agent |
-| **OSWorld + Agent-S** | [`scaffold/osworld`](../examples/scaffold/osworld) | OSWorld desktop GUI scaffold using pinned Agent-S as the agent loop |
+| **OSWorld + Qwen3.5** | [`scaffold/osworld`](../examples/scaffold/osworld) | Thin wrapper around OSWorld's native Qwen3VL multi-env GUI runner |
 
 ### Quick Example: OpenHands
 
@@ -32,4 +32,4 @@ Benchmark modules contain launch scripts, adapters, and analysis code for studyi
 | Benchmark | Directory | Description |
 |-----------|-----------|-------------|
 | **SWE-bench** | [`benchmark/swebench`](../examples/benchmark/swebench) | OpenHands + ThunderAgent runner and tool-call/profile analysis utilities |
-| **OSWorld-Verified** | [`benchmark/osworld_verified`](../examples/benchmark/osworld_verified) | OSWorld + Agent-S runner and computer-use trace analysis |
+| **OSWorld-Verified** | [`benchmark/osworld_verified`](../examples/benchmark/osworld_verified) | OSWorld native Qwen3VL runner through Qwen3.5 and ThunderAgent |

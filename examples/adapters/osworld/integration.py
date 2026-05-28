@@ -18,7 +18,7 @@ def prepare_openai_kwargs(
     *,
     instance_id: str,
     base_url: str | None = None,
-    scaffold: str = "osworld-agent-s",
+    scaffold: str = "osworld-native-qwen35",
 ) -> tuple[ThunderAgentProgram, dict[str, Any]]:
     """Return ``(program, patched_openai_kwargs)`` for one OSWorld task."""
     program = ThunderAgentProgram.create(
@@ -37,7 +37,7 @@ def osworld_instance(
     *,
     instance_id: str,
     base_url: str | None = None,
-    scaffold: str = "osworld-agent-s",
+    scaffold: str = "osworld-native-qwen35",
 ) -> Iterator[tuple[ThunderAgentProgram, dict[str, Any]]]:
     """Context manager for one OSWorld/OSWorld-Verified benchmark task."""
     program, patched_kwargs = prepare_openai_kwargs(
