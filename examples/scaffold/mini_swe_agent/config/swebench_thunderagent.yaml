@@ -150,8 +150,16 @@ model:
   api_key: "EMPTY"
   stream: false
   timeout: null
-  max_completion_tokens: 2048
+  max_completion_tokens: 4096
   model_kwargs:
     drop_params: true
-    temperature: 0.0
+    temperature: 0.6
+    top_p: 0.95
+    presence_penalty: 0.0
     parallel_tool_calls: true
+    extra_body:
+      top_k: 20
+      min_p: 0.0
+      repetition_penalty: 1.0
+      chat_template_kwargs:
+        enable_thinking: true

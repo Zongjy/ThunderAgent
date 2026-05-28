@@ -197,6 +197,29 @@ examples/benchmark/swebench/runs/<run_name>/_analysis/
 └── swebench_instances.csv
 ```
 
+## 甘特图可视化
+
+OpenHands 的 `output.jsonl` 里每条记录都带 `history`，其中 agent action 和 observation 有时间戳；ThunderAgent 也会在
+`thunderagent_profiles/step_profiles.csv` 记录每个 program step 的完成时间。可以直接生成 OpenHands 事件级甘特图：
+
+```bash
+python examples/benchmark/swebench/visualize_swebench_gantt.py \
+  --root examples/benchmark/swebench/runs/openhands_swebench_default_20260517_143641 \
+  --root examples/benchmark/swebench/runs/openhands_swebench_tr_20260517_205945 \
+  --output examples/benchmark/swebench/runs/_gantt/default_vs_tr_openhands_gantt.html \
+  --title "OpenHands SWE-bench default vs tr Gantt"
+```
+
+默认会同时输出：
+
+```text
+examples/benchmark/swebench/runs/_gantt/default_vs_tr_openhands_gantt.html
+examples/benchmark/swebench/runs/_gantt/default_vs_tr_openhands_gantt.events.csv
+```
+
+HTML 里每一行是一个 SWE-bench instance，蓝色为 LLM 时间，其他颜色为 OpenHands tool/runtime 时间；把鼠标悬停在条段上可看
+run、instance、phase、action、step、起止时间和耗时。
+
 ## 后续解析
 
 下一步需要写 converter，把：
