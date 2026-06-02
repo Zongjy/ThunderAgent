@@ -52,6 +52,7 @@ Important defaults:
 - `OSWORLD_MAX_STEPS=100`
 - `OSWORLD_OBSERVATION_TYPE=screenshot`
 - `OSWORLD_ACTION_SPACE=pyautogui`
+- `OSWORLD_PROGRESS=1`
 - `ENABLE_VLLM_TOOL_CALLING=1`
 - `TOOL_CALL_PARSER=qwen3_coder`
 - `VLLM_ENFORCE_STRICT_TOOL_CALLING=1`
@@ -82,3 +83,8 @@ so ThunderAgent can profile and schedule each desktop episode independently.
 Native OSWorld results are written under
 `<run>/osworld_outputs/summary/results.json`, with task artifacts under
 `<run>/osworld_outputs/<action_space>/<observation_type>/<model>/<domain>/<id>/`.
+
+The ThunderAgent wrapper also prints an overall progress line while the native
+multi-process OSWorld runner is active. Worker processes append task start, step,
+and end events to `<run>/osworld_outputs/_progress.jsonl`. Set
+`OSWORLD_PROGRESS=0` to silence the progress line.

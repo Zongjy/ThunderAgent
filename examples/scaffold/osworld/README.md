@@ -43,3 +43,10 @@ and consumes tasks from OSWorld's shared multiprocessing queue.
 For local VM providers, use `N=1` unless you have provisioned independent VMs or
 containers. For cloud providers, make sure quota and cleanup are ready before
 raising concurrency.
+
+## Progress
+
+The wrapper prints an overall task progress line by default while OSWorld's
+native multi-process runner is active. It records task start, step, and end
+events in `<output-dir>/_progress.jsonl`; use `--no-progress` to disable the
+terminal progress line.

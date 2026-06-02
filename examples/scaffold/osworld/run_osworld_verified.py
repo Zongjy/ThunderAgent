@@ -18,6 +18,7 @@ import os
 import re
 import runpy
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -29,6 +30,7 @@ DEFAULT_MODEL = "qwen3.5-27B"
 DEFAULT_BASE_URL = "http://127.0.0.1:9000/v1"
 DEFAULT_SCAFFOLD = "osworld-native-qwen35"
 DEFAULT_HF_ENDPOINT = "https://hf-mirror.com"
+PROGRESS_EVENT_FILENAME = "_progress.jsonl"
 
 MOUSE_ACTIONS = {
     "mouse_move",
@@ -115,6 +117,26 @@ def env_flag(name: str, default: bool = False) -> bool:
     if value is None:
         return default
     return value.strip().lower() not in {"", "0", "false", "no", "off"}
+
+
+def env_int(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    if value is None or not value.strip():
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
+def env_float(name: str, default: float) -> float:
+    value = os.environ.get(name)
+    if value is None or not value.strip():
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        return default
 
 
 def parse_args() -> argparse.Namespace:
@@ -211,6 +233,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sleep-after-execution", "--sleep_after_execution", dest="sleep_after_execution", type=float, default=0.0)
     parser.add_argument("--max-steps", "--max_steps", dest="max_steps", type=int, default=15)
     parser.add_argument("--log-level", "--log_level", dest="log_level", default="INFO")
+    parser.add_argument(
+        "--progress",
+        action=argparse.BooleanOptionalAction,
+        default=env_flag("OSWORLD_PROGRESS", True),
+        help="Show an overall OSWorld task progress bar while the native runner works.",
+    )
+    parser.add_argument(
+        "--progress-interval",
+        "--progress_interval",
+        dest="progress_interval",
+        type=float,
+        default=env_float("OSWORLD_PROGRESS_INTERVAL", 10.0),
+        help="Seconds between progress refreshes.",
+    )
 
     # Compatibility knobs accepted by the older ThunderAgent-local runner.  The
     # native OSWorld Qwen3VL runner hardcodes these behaviors.
@@ -259,6 +295,8 @@ def configure_args(args: argparse.Namespace) -> argparse.Namespace:
         raise ValueError("--max-concurrency/--num-envs must be >= 1")
     if args.history_n < 0:
         raise ValueError("--qwen3vl-history-n must be >= 0")
+    if args.progress_interval <= 0:
+        raise ValueError("--progress-interval must be > 0")
     if args.max_retries < 1:
         raise ValueError("--qwen3vl-max-retries must be >= 1")
     if args.action_space != "pyautogui":
@@ -331,6 +369,91 @@ def content_to_text(content: Any) -> str:
                     chunks.append(str(part.get("text", "")))
         return "\n".join(chunk for chunk in chunks if chunk)
     return str(content)
+
+
+def message_payload_stats(messages: list[dict[str, Any]]) -> dict[str, int]:
+    stats = {"message_count": len(messages), "image_count": 0, "text_chars": 0}
+
+    def visit(content: Any) -> None:
+        if isinstance(content, str):
+            stats["text_chars"] += len(content)
+        elif isinstance(content, list):
+            for part in content:
+                visit(part)
+        elif isinstance(content, dict):
+            part_type = content.get("type")
+            if part_type in {"image_url", "input_image"} or "image_url" in content:
+                stats["image_count"] += 1
+                return
+            if "text" in content:
+                stats["text_chars"] += len(str(content.get("text") or ""))
+                return
+            for value in content.values():
+                visit(value)
+
+    for message in messages:
+        visit(message.get("content"))
+    return stats
+
+
+def object_value(obj: Any, name: str, default: Any = None) -> Any:
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        return obj.get(name, default)
+    return getattr(obj, name, default)
+
+
+def completion_usage_metadata(usage: Any) -> dict[str, Any]:
+    metadata: dict[str, Any] = {}
+    for name in ("prompt_tokens", "completion_tokens", "total_tokens"):
+        value = object_value(usage, name)
+        if value is not None:
+            metadata[name] = value
+
+    prompt_details = object_value(usage, "prompt_tokens_details")
+    cached_tokens = object_value(prompt_details, "cached_tokens")
+    if cached_tokens is not None:
+        metadata["cached_tokens"] = cached_tokens
+
+    completion_details = object_value(usage, "completion_tokens_details")
+    reasoning_tokens = object_value(completion_details, "reasoning_tokens")
+    if reasoning_tokens is not None:
+        metadata["reasoning_tokens"] = reasoning_tokens
+    return metadata
+
+
+def choice_finish_reason(choice: Any) -> Any:
+    return object_value(choice, "finish_reason")
+
+
+def count_items(value: Any) -> int | None:
+    if value is None:
+        return 0
+    try:
+        return len(value)
+    except TypeError:
+        return None
+
+
+def bytes_len(value: Any) -> int | None:
+    if isinstance(value, (bytes, bytearray)):
+        return len(value)
+    return None
+
+
+def summarize_text(value: Any, *, limit: int = 240) -> str:
+    if isinstance(value, str):
+        text = value
+    else:
+        try:
+            text = json.dumps(value, ensure_ascii=False, default=str)
+        except (TypeError, ValueError):
+            text = repr(value)
+    text = " ".join(text.split())
+    if len(text) <= limit:
+        return text
+    return f"{text[: limit - 3]}..."
 
 
 def text_content(text: str) -> list[dict[str, str]]:
@@ -648,6 +771,151 @@ def write_selected_meta(result_dir: str, selected_meta: dict[str, list[str]]) ->
     return str(path)
 
 
+def total_task_count(meta: dict[str, list[str]]) -> int:
+    return sum(len(example_ids) for example_ids in meta.values())
+
+
+def progress_event_path(result_dir: str | Path) -> Path:
+    return Path(result_dir) / PROGRESS_EVENT_FILENAME
+
+
+def reset_progress_events(result_dir: str | Path) -> Path:
+    path = progress_event_path(result_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("", encoding="utf-8")
+    return path
+
+
+def write_progress_event(result_dir: str | Path, event: dict[str, Any]) -> None:
+    path = progress_event_path(result_dir)
+    payload = {
+        "ts": time.time(),
+        "pid": os.getpid(),
+        **event,
+    }
+    line = json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n"
+    encoded = line.encode("utf-8")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o644)
+        try:
+            os.write(fd, encoded)
+        finally:
+            os.close(fd)
+    except OSError:
+        return
+
+
+def format_duration(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours:d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+
+def progress_bar(done: int, total: int, *, width: int = 28) -> str:
+    if total <= 0:
+        return "[" + "." * width + "]"
+    filled = min(width, int(round(width * done / total)))
+    return "[" + "#" * filled + "." * (width - filled) + "]"
+
+
+class ProgressMonitor:
+    """Render a coarse overall progress bar from worker-written JSONL events."""
+
+    def __init__(self, *, path: Path, total: int, interval_s: float) -> None:
+        self.path = path
+        self.total = total
+        self.interval_s = interval_s
+        self.started: set[str] = set()
+        self.finished: dict[str, str] = {}
+        self.step_count = 0
+        self.last_task = ""
+        self.last_action = ""
+        self.start_time = time.time()
+        self._offset = 0
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        self._thread = threading.Thread(
+            target=self._run,
+            name="osworld-progress",
+            daemon=True,
+        )
+        self._thread.start()
+        self.render(force=True)
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=max(1.0, min(self.interval_s, 5.0)))
+        self.read_new_events()
+        self.render(force=True, final=True)
+
+    def _run(self) -> None:
+        while not self._stop_event.wait(self.interval_s):
+            self.read_new_events()
+            self.render()
+
+    def read_new_events(self) -> None:
+        try:
+            size = self.path.stat().st_size
+        except FileNotFoundError:
+            return
+        if size < self._offset:
+            self._offset = 0
+        try:
+            with self.path.open(encoding="utf-8") as handle:
+                handle.seek(self._offset)
+                for line in handle:
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    self.apply_event(event)
+                self._offset = handle.tell()
+        except OSError:
+            return
+
+    def apply_event(self, event: dict[str, Any]) -> None:
+        task_id = str(event.get("task_id") or "")
+        if task_id:
+            self.last_task = task_id
+        event_name = event.get("event")
+        if event_name == "task_start" and task_id:
+            self.started.add(task_id)
+        elif event_name == "task_step":
+            self.step_count += 1
+            action = event.get("action")
+            if action:
+                self.last_action = summarize_text(action, limit=80)
+        elif event_name == "task_end" and task_id:
+            self.finished[task_id] = str(event.get("status") or "done")
+
+    def render(self, *, force: bool = False, final: bool = False) -> None:
+        del force
+        done = len(self.finished)
+        active = len(self.started - set(self.finished))
+        errors = sum(1 for status in self.finished.values() if status != "done")
+        pct = (done / self.total * 100.0) if self.total else 0.0
+        line = (
+            f"[OSWorld progress] {progress_bar(done, self.total)} "
+            f"{done}/{self.total} tasks ({pct:5.1f}%) "
+            f"active={active} steps={self.step_count} errors={errors} "
+            f"elapsed={format_duration(time.time() - self.start_time)}"
+        )
+        if self.last_task:
+            line += f" last={self.last_task}"
+        if self.last_action and not final:
+            line += f" action={self.last_action}"
+        if final:
+            line += " final"
+        print(line, file=sys.stderr, flush=True)
+
+
 def should_rewrite_hf_urls() -> bool:
     return os.environ.get("OSWORLD_REWRITE_HF_URLS", "1") != "0"
 
@@ -724,11 +992,296 @@ def install_thunderagent_patches(
 ) -> None:
     import lib_run_single
     from examples.adapters.osworld import osworld_instance
+    from examples.scaffold.osworld.timing_trace import (
+        TaskTrace,
+        current_trace,
+        maybe_span,
+        reset_current_trace,
+        set_current_trace,
+    )
     from ThunderAgent.adapters import inject_program_id
+    import desktop_env.desktop_env as desktop_env_module
+    from desktop_env.controllers.python import PythonController
+    from desktop_env.desktop_env import DesktopEnv
     from mm_agents import qwen3vl_agent as qwen3vl_module
 
     parsed_extra_body = safe_json_object(args.extra_body, option_name="--extra-body")
     qwen3vl_module.MAX_RETRY_TIMES = args.max_retries
+
+    if not getattr(qwen3vl_module.Qwen3VLAgent, "_thunderagent_predict_timing_patched", False):
+        original_predict = qwen3vl_module.Qwen3VLAgent.predict
+
+        def patched_predict(self: Any, instruction: str, obs: dict[str, Any]) -> Any:
+            step_id = len(getattr(self, "actions", [])) + 1
+            screenshot_size = bytes_len(obs.get("screenshot")) if isinstance(obs, dict) else None
+            trace = current_trace()
+            with maybe_span(
+                trace,
+                "agent.predict",
+                step_id=step_id,
+                metadata={
+                    "instruction_chars": len(instruction or ""),
+                    "screenshot_bytes": screenshot_size,
+                    "history_actions": len(getattr(self, "actions", [])),
+                },
+            ) as span:
+                response, actions = original_predict(self, instruction, obs)
+                if isinstance(actions, list):
+                    action_count = len(actions)
+                elif actions is None:
+                    action_count = 0
+                else:
+                    action_count = 1
+                span.update(
+                    action_count=action_count,
+                    response_len=len(response or ""),
+                )
+                return response, actions
+
+        qwen3vl_module.Qwen3VLAgent.predict = patched_predict
+        qwen3vl_module.Qwen3VLAgent._thunderagent_predict_timing_patched = True
+
+    if not getattr(qwen3vl_module.Qwen3VLAgent, "_thunderagent_parse_timing_patched", False):
+        original_parse_response = qwen3vl_module.Qwen3VLAgent.parse_response
+
+        def patched_parse_response(
+            self: Any,
+            response: str,
+            *parse_args: Any,
+            **parse_kwargs: Any,
+        ) -> Any:
+            step_id = len(getattr(self, "actions", [])) + 1
+            trace = current_trace()
+            with maybe_span(
+                trace,
+                "parse_response_to_pyautogui",
+                step_id=step_id,
+                metadata={
+                    "response_len": len(response or ""),
+                    "coordinate_type": getattr(self, "coordinate_type", None),
+                },
+            ) as span:
+                low_level_instruction, pyautogui_code = original_parse_response(
+                    self, response, *parse_args, **parse_kwargs
+                )
+                first_action = (
+                    pyautogui_code[0]
+                    if isinstance(pyautogui_code, list) and pyautogui_code
+                    else ""
+                )
+                span.update(
+                    low_level_action=summarize_text(low_level_instruction),
+                    pyautogui_action_count=len(pyautogui_code)
+                    if isinstance(pyautogui_code, list)
+                    else 0,
+                    first_pyautogui_action=summarize_text(first_action),
+                )
+                return low_level_instruction, pyautogui_code
+
+        qwen3vl_module.Qwen3VLAgent.parse_response = patched_parse_response
+        qwen3vl_module.Qwen3VLAgent._thunderagent_parse_timing_patched = True
+
+    if not getattr(DesktopEnv, "_thunderagent_step_timing_patched", False):
+        def patched_step(self: Any, action: Any, pause: float = 2) -> Any:
+            raw_step_no = getattr(self, "_step_no", 0)
+            try:
+                step_id = int(raw_step_no) + 1
+            except (TypeError, ValueError):
+                step_id = None
+            trace = current_trace()
+            trace_task_id = getattr(trace, "task_id", "") if trace is not None else ""
+            if trace_task_id:
+                write_progress_event(
+                    args.result_dir,
+                    {
+                        "event": "task_step",
+                        "task_id": trace_task_id,
+                        "step_id": step_id,
+                        "action": summarize_text(action),
+                    },
+                )
+            with maybe_span(
+                trace,
+                "desktop_env.step",
+                step_id=step_id,
+                metadata={
+                    "action_type": type(action).__name__,
+                    "action_summary": summarize_text(action),
+                    "pause_s": pause,
+                },
+            ) as span:
+                self._step_no += 1
+                self.action_history.append(action)
+                self.is_environment_used = True
+
+                reward = 0
+                done = False
+                info: dict[str, Any] = {}
+                desktop_env_module.logger.info(
+                    "Step %s in trajectory %s with action: %s",
+                    self._step_no,
+                    self._traj_no,
+                    action,
+                )
+
+                is_special_action = action in ["WAIT", "FAIL", "DONE"] or (
+                    isinstance(action, dict)
+                    and action.get("action_type") in ["WAIT", "FAIL", "DONE"]
+                )
+                if is_special_action:
+                    if action == "WAIT" or (
+                        type(action) == dict and action.get("action_type") == "WAIT"
+                    ):
+                        with maybe_span(
+                            trace,
+                            "desktop_env.special_action_sleep",
+                            metadata={"sleep_s": pause},
+                        ):
+                            time.sleep(pause)
+                    elif action == "FAIL" or (
+                        type(action) == dict and action.get("action_type") == "FAIL"
+                    ):
+                        done = True
+                        info = {"fail": True}
+                    elif action == "DONE" or (
+                        type(action) == dict and action.get("action_type") == "DONE"
+                    ):
+                        done = True
+                        info = {"done": True}
+
+                if self.action_space == "computer_13":
+                    self.controller.execute_action(action)
+                elif self.action_space in {"pyautogui", "claude_computer_use"}:
+                    if is_special_action:
+                        self.controller.execute_action(action)
+                    else:
+                        if type(action) == str:
+                            command = action
+                            self.controller.execute_python_command(command)
+                        elif type(action) == dict:
+                            command = action["command"]
+                            self.controller.execute_python_command(command)
+
+                with maybe_span(
+                    trace,
+                    "desktop_env.sleep_after_execution",
+                    metadata={"sleep_s": pause},
+                ):
+                    time.sleep(pause)
+                observation = self._get_obs()
+
+                span.update(reward=reward, done=done, info=info)
+                return observation, reward, done, info
+
+        DesktopEnv.step = patched_step
+        DesktopEnv._thunderagent_step_timing_patched = True
+
+    if not getattr(DesktopEnv, "_thunderagent_get_obs_timing_patched", False):
+        original_get_obs = DesktopEnv._get_obs
+
+        def patched_get_obs(self: Any) -> Any:
+            raw_step_no = getattr(self, "_step_no", None)
+            step_id = raw_step_no if isinstance(raw_step_no, int) else None
+            trace = current_trace()
+            with maybe_span(
+                trace,
+                "desktop_env.get_obs",
+                step_id=step_id,
+                metadata={
+                    "require_a11y_tree": getattr(self, "require_a11y_tree", None),
+                    "require_terminal": getattr(self, "require_terminal", None),
+                },
+            ) as span:
+                observation = original_get_obs(self)
+                screenshot = (
+                    observation.get("screenshot")
+                    if isinstance(observation, dict)
+                    else None
+                )
+                span.update(
+                    screenshot_bytes=bytes_len(screenshot),
+                    screenshot_success=screenshot is not None,
+                    has_accessibility_tree=bool(
+                        observation.get("accessibility_tree")
+                    )
+                    if isinstance(observation, dict)
+                    else None,
+                    has_terminal=bool(observation.get("terminal"))
+                    if isinstance(observation, dict)
+                    else None,
+                )
+                return observation
+
+        DesktopEnv._get_obs = patched_get_obs
+        DesktopEnv._thunderagent_get_obs_timing_patched = True
+
+    if not getattr(DesktopEnv, "_thunderagent_evaluate_timing_patched", False):
+        original_evaluate = DesktopEnv.evaluate
+
+        def patched_evaluate(self: Any) -> Any:
+            trace = current_trace()
+            with maybe_span(
+                trace,
+                "desktop_env.evaluate",
+                metadata={"task_id": getattr(self, "task_id", None)},
+            ) as span:
+                result = original_evaluate(self)
+                span.update(result=result)
+                return result
+
+        DesktopEnv.evaluate = patched_evaluate
+        DesktopEnv._thunderagent_evaluate_timing_patched = True
+
+    if not getattr(PythonController, "_thunderagent_screenshot_timing_patched", False):
+        original_get_screenshot = PythonController.get_screenshot
+
+        def patched_get_screenshot(self: Any) -> Any:
+            trace = current_trace()
+            with maybe_span(trace, "controller.get_screenshot") as span:
+                screenshot = original_get_screenshot(self)
+                span.update(
+                    success=screenshot is not None,
+                    image_bytes=bytes_len(screenshot),
+                )
+                return screenshot
+
+        PythonController.get_screenshot = patched_get_screenshot
+        PythonController._thunderagent_screenshot_timing_patched = True
+
+    if not getattr(PythonController, "_thunderagent_execute_timing_patched", False):
+        original_execute_python_command = PythonController.execute_python_command
+
+        def patched_execute_python_command(self: Any, command: str) -> Any:
+            trace = current_trace()
+            with maybe_span(
+                trace,
+                "controller.execute_python_command",
+                metadata={
+                    "command_summary": summarize_text(command),
+                    "command_chars": len(command or ""),
+                },
+            ) as span:
+                result = original_execute_python_command(self, command)
+                returncode = None
+                stdout_len = None
+                stderr_len = None
+                if isinstance(result, dict):
+                    for key in ("returncode", "return_code", "exit_code", "code"):
+                        if key in result:
+                            returncode = result[key]
+                            break
+                    stdout_len = len(str(result.get("stdout", result.get("output", ""))))
+                    stderr_len = len(str(result.get("stderr", "")))
+                span.update(
+                    success=result is not None,
+                    returncode=returncode,
+                    stdout_chars=stdout_len,
+                    stderr_chars=stderr_len,
+                )
+                return result
+
+        PythonController.execute_python_command = patched_execute_python_command
+        PythonController._thunderagent_execute_timing_patched = True
 
     if not getattr(qwen3vl_module.Qwen3VLAgent, "_thunderagent_init_patched", False):
         original_init = qwen3vl_module.Qwen3VLAgent.__init__
@@ -760,6 +1313,8 @@ def install_thunderagent_patches(
         logger = qwen3vl_module.logger
         last_error: Exception | None = None
         for attempt in range(1, args.max_retries + 1):
+            step_id = len(getattr(self, "actions", [])) + 1
+            trace = current_trace()
             if logger is not None:
                 logger.info(
                     "[OpenAI/ThunderAgent] Generating content with model: %s "
@@ -769,52 +1324,124 @@ def install_thunderagent_patches(
                     args.max_retries,
                 )
             try:
-                extra_body = dict(parsed_extra_body)
-                chat_template_kwargs = extra_body.get("chat_template_kwargs") or {}
-                if not isinstance(chat_template_kwargs, dict):
-                    chat_template_kwargs = {}
-                chat_template_kwargs["enable_thinking"] = bool(args.enable_thinking)
-                extra_body["chat_template_kwargs"] = chat_template_kwargs
-                if args.enable_thinking:
-                    extra_body.setdefault("thinking_token_budget", args.thinking_budget)
-                extra_body = inject_program_id(extra_body)
-                request_messages = messages
-                request_kwargs: dict[str, Any] = {}
-                if args.use_vllm_tool_calls:
-                    request_messages = prepare_messages_for_native_tool_calls(
-                        messages, args.coordinate_type
-                    )
-                    request_kwargs.update(
-                        {
-                            "tools": [COMPUTER_USE_TOOL],
-                            "tool_choice": native_tool_choice(args.tool_choice),
-                            "parallel_tool_calls": False,
-                        }
+                with maybe_span(
+                    trace,
+                    "llm.prepare_request",
+                    step_id=step_id,
+                    metadata={
+                        "attempt": attempt,
+                        "model": model,
+                        "use_vllm_tool_calls": bool(args.use_vllm_tool_calls),
+                    },
+                ) as prepare_span:
+                    extra_body = dict(parsed_extra_body)
+                    chat_template_kwargs = extra_body.get("chat_template_kwargs") or {}
+                    if not isinstance(chat_template_kwargs, dict):
+                        chat_template_kwargs = {}
+                    chat_template_kwargs["enable_thinking"] = bool(args.enable_thinking)
+                    extra_body["chat_template_kwargs"] = chat_template_kwargs
+                    if args.enable_thinking:
+                        extra_body.setdefault(
+                            "thinking_token_budget", args.thinking_budget
+                        )
+                    extra_body = inject_program_id(extra_body)
+                    request_messages = messages
+                    request_kwargs: dict[str, Any] = {}
+                    if args.use_vllm_tool_calls:
+                        request_messages = prepare_messages_for_native_tool_calls(
+                            messages, args.coordinate_type
+                        )
+                        request_kwargs.update(
+                            {
+                                "tools": [COMPUTER_USE_TOOL],
+                                "tool_choice": native_tool_choice(args.tool_choice),
+                                "parallel_tool_calls": False,
+                            }
+                        )
+                    request_stats = message_payload_stats(request_messages)
+                    prepare_span.update(
+                        **request_stats,
+                        original_message_count=len(messages),
+                        extra_body_keys=sorted(extra_body.keys()),
+                        has_program_id=bool(extra_body.get("program_id")),
+                        max_tokens=self.max_tokens,
+                        temperature=self.temperature,
+                        top_p=self.top_p,
                     )
 
-                completion = client.chat.completions.create(
-                    model=model,
-                    messages=request_messages,
-                    max_tokens=self.max_tokens,
-                    temperature=self.temperature,
-                    top_p=self.top_p,
-                    extra_body=extra_body,
-                    timeout=args.request_timeout,
-                    **request_kwargs,
-                )
-                message = completion.choices[0].message
-                content = content_to_text(getattr(message, "content", None))
-                if args.use_vllm_tool_calls:
-                    native_response = tool_calls_to_legacy_response(
-                        getattr(message, "tool_calls", None), content
+                request_metadata: dict[str, Any] = {
+                    "attempt": attempt,
+                    "model": model,
+                    "timeout_s": args.request_timeout,
+                    "use_vllm_tool_calls": bool(args.use_vllm_tool_calls),
+                    **request_stats,
+                }
+                with maybe_span(
+                    trace,
+                    "llm.request",
+                    step_id=step_id,
+                    metadata=request_metadata,
+                ) as request_span:
+                    completion = client.chat.completions.create(
+                        model=model,
+                        messages=request_messages,
+                        max_tokens=self.max_tokens,
+                        temperature=self.temperature,
+                        top_p=self.top_p,
+                        extra_body=extra_body,
+                        timeout=args.request_timeout,
+                        **request_kwargs,
                     )
+                    choices = object_value(completion, "choices", []) or []
+                    first_choice = choices[0] if choices else None
+                    request_span.update(
+                        choice_count=count_items(choices),
+                        finish_reason=choice_finish_reason(first_choice),
+                        response_id=object_value(completion, "id"),
+                        **completion_usage_metadata(
+                            object_value(completion, "usage")
+                        ),
+                    )
+
+                choices = object_value(completion, "choices", []) or []
+                message = object_value(choices[0], "message") if choices else None
+                content = content_to_text(object_value(message, "content"))
+                if args.use_vllm_tool_calls:
+                    tool_calls = object_value(message, "tool_calls")
+                    with maybe_span(
+                        trace,
+                        "llm.native_tool_calls_to_legacy",
+                        step_id=step_id,
+                        metadata={
+                            "attempt": attempt,
+                            "tool_call_count": count_items(tool_calls),
+                            "content_chars": len(content),
+                        },
+                    ) as native_span:
+                        native_response = tool_calls_to_legacy_response(
+                            tool_calls, content
+                        )
+                        native_span.update(
+                            parsed=bool(native_response),
+                            legacy_response_chars=len(native_response),
+                        )
                     if native_response:
                         if logger is not None:
                             logger.info(
                                 "[OpenAI/ThunderAgent] Parsed native tool_calls from vLLM"
                             )
                         return native_response
-                    xml_response = qwen_xml_content_to_legacy_response(content)
+                    with maybe_span(
+                        trace,
+                        "llm.xml_tool_call_parse",
+                        step_id=step_id,
+                        metadata={"attempt": attempt, "content_chars": len(content)},
+                    ) as xml_span:
+                        xml_response = qwen_xml_content_to_legacy_response(content)
+                        xml_span.update(
+                            parsed=bool(xml_response),
+                            legacy_response_chars=len(xml_response),
+                        )
                     if xml_response:
                         if logger is not None:
                             logger.info(
@@ -823,7 +1450,8 @@ def install_thunderagent_patches(
                         return xml_response
                     if logger is not None:
                         logger.warning(
-                            "[OpenAI/ThunderAgent] No native tool_calls returned; falling back to content parser"
+                            "[OpenAI/ThunderAgent] No native tool_calls returned; "
+                            "falling back to content parser"
                         )
                 return content
             except Exception as exc:  # match OSWorld's forgiving retry behavior
@@ -831,7 +1459,14 @@ def install_thunderagent_patches(
                 if logger is not None:
                     logger.error("[OpenAI/ThunderAgent] Error calling model: %s", exc)
                 if attempt < args.max_retries:
-                    time.sleep(min(5.0 * attempt, 30.0))
+                    retry_sleep_s = min(5.0 * attempt, 30.0)
+                    with maybe_span(
+                        current_trace(),
+                        "llm.retry_sleep",
+                        step_id=step_id,
+                        metadata={"attempt": attempt, "sleep_s": retry_sleep_s},
+                    ):
+                        time.sleep(retry_sleep_s)
         if logger is not None and last_error is not None:
             logger.error("[OpenAI/ThunderAgent] Exhausted retries: %s", last_error)
         return ""
@@ -855,22 +1490,90 @@ def install_thunderagent_patches(
             domain = id_to_domain.get(example_id) or Path(example_result_dir).parent.name
             patched_example = rewrite_hf_urls(example) if should_rewrite_hf_urls() else example
             instance_id = f"{domain}/{example_id}"
+            write_progress_event(
+                args.result_dir,
+                {
+                    "event": "task_start",
+                    "task_id": instance_id,
+                    "domain": domain,
+                    "example_id": example_id,
+                },
+            )
+            started_at = time.time()
+            task_failed = False
             with osworld_instance(
                 {},
                 instance_id=instance_id,
                 base_url=args.base_url,
                 scaffold=args.scaffold,
-            ):
-                return original_run_single_example(
-                    agent,
-                    env,
-                    patched_example,
-                    max_steps,
-                    instruction,
-                    run_args,
-                    example_result_dir,
-                    scores,
+            ) as (program, _):
+                trace = TaskTrace(
+                    task_id=instance_id,
+                    program_id=program.program_id,
+                    result_dir=example_result_dir,
                 )
+                trace_token = set_current_trace(trace)
+                try:
+                    with trace.span(
+                        "osworld.task",
+                        metadata={
+                            "example_id": example_id,
+                            "domain": domain,
+                            "instruction_chars": len(instruction or ""),
+                            "max_steps": max_steps,
+                            "model": args.model,
+                        },
+                    ):
+                        return original_run_single_example(
+                            agent,
+                            env,
+                            patched_example,
+                            max_steps,
+                            instruction,
+                            run_args,
+                            example_result_dir,
+                            scores,
+                        )
+                except Exception as exc:
+                    task_failed = True
+                    write_progress_event(
+                        args.result_dir,
+                        {
+                            "event": "task_end",
+                            "status": "error",
+                            "task_id": instance_id,
+                            "domain": domain,
+                            "example_id": example_id,
+                            "duration_s": time.time() - started_at,
+                            "error": f"{type(exc).__name__}: {exc}",
+                        },
+                    )
+                    raise
+                finally:
+                    reset_current_trace(trace_token)
+                    if not task_failed:
+                        result_path = Path(example_result_dir) / "result.txt"
+                        status = "done" if result_path.exists() else "missing_result"
+                        result_value = None
+                        if result_path.exists():
+                            try:
+                                result_value = float(
+                                    result_path.read_text(encoding="utf-8").strip()
+                                )
+                            except (OSError, ValueError):
+                                result_value = None
+                        write_progress_event(
+                            args.result_dir,
+                            {
+                                "event": "task_end",
+                                "status": status,
+                                "task_id": instance_id,
+                                "domain": domain,
+                                "example_id": example_id,
+                                "duration_s": time.time() - started_at,
+                                "result": result_value,
+                            },
+                        )
 
         lib_run_single.run_single_example = patched_run_single_example
         lib_run_single._thunderagent_run_single_patched = True
@@ -948,6 +1651,16 @@ def main() -> int:
 
     selected_meta = select_tasks(args)
     selected_meta_path = write_selected_meta(args.result_dir, selected_meta)
+    progress_path = reset_progress_events(args.result_dir)
+    progress_monitor = (
+        ProgressMonitor(
+            path=progress_path,
+            total=total_task_count(selected_meta),
+            interval_s=args.progress_interval,
+        )
+        if args.progress
+        else None
+    )
     id_to_domain = {
         example_id: domain
         for domain, example_ids in selected_meta.items()
@@ -970,8 +1683,12 @@ def main() -> int:
         (osworld_root / "logs").mkdir(exist_ok=True)
         os.chdir(osworld_root)
         sys.argv = build_native_argv(args, selected_meta_path)
+        if progress_monitor is not None:
+            progress_monitor.start()
         runpy.run_path(str(native_runner), run_name="__main__")
     finally:
+        if progress_monitor is not None:
+            progress_monitor.stop()
         sys.argv = old_argv
         os.chdir(old_cwd)
     return 0
